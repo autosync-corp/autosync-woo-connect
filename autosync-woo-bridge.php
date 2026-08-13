@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.5
+ * Version: 0.1.6
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -32,36 +32,63 @@ register_activation_hook(__FILE__, 'aswb_provision_shipping_methods');
 add_action('admin_init', function () {
     // register_activation_hook only fires on a fresh install, not a re-upload
     // over an existing one - this catches that case on the next admin visit.
-    // v2: bumped from v1 (which used a Flat Rate placeholder, since replaced
-    // with Free Shipping) specifically so this runs again even on a site that
-    // already ran v1 - the "skip a zone with a method" guard below would
-    // otherwise leave the old Flat Rate method in place forever.
-    if (get_option('aswb_shipping_provisioned_v2')) return;
+    if (get_option('aswb_shipping_provisioned_v3')) return;
     aswb_provision_shipping_methods();
-    update_option('aswb_shipping_provisioned_v2', 1);
+    update_option('aswb_shipping_provisioned_v3', 1);
+});
+
+// Handle the manual "Run shipping provisioning now" button on the settings page -
+// added because the automatic run (above) produced no visible effect on the real
+// site and there's no server-log access to see why silently. This makes the
+// attempt observable: every zone checked, and exactly what happened to it, is
+// stored in aswb_shipping_provision_log and displayed on the settings page.
+add_action('admin_post_aswb_run_shipping_provisioning', function () {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    check_admin_referer('aswb_run_shipping_provisioning');
+    aswb_provision_shipping_methods();
+    wp_redirect(add_query_arg('aswb_ran', '1', admin_url('options-general.php?page=aswb-settings')));
+    exit;
 });
 
 function aswb_provision_shipping_methods() {
-    if (!class_exists('WC_Shipping_Zones') || !class_exists('WC_Shipping_Zone')) return;
-    $zoneIds = [0]; // zone 0 = the always-existing "Locations not covered by your other zones"
-    foreach (WC_Shipping_Zones::get_zones() as $zone) {
-        $zoneIds[] = $zone['id'];
+    $log = [];
+    if (!class_exists('WC_Shipping_Zones') || !class_exists('WC_Shipping_Zone')) {
+        $log[] = 'WooCommerce shipping-zone classes not found - is WooCommerce active?';
+        update_option('aswb_shipping_provision_log', $log);
+        return;
     }
-    foreach (array_unique($zoneIds) as $zoneId) {
-        $zone = new WC_Shipping_Zone($zoneId);
-        if (!empty($zone->get_shipping_methods())) continue; // already has a method - leave it alone
-        // Free Shipping, not a Flat Rate priced at 0 - "free" is unambiguous and
-        // has no cost field to accidentally edit later. Editing this method's
-        // cost would double-charge, since the real amount already lives in our
-        // own "Shipping" fee (aswb_apply_fees) - a Flat Rate with a $0 field
-        // sitting right there in wp-admin invites exactly that mistake.
-        $instanceId = $zone->add_shipping_method('free_shipping');
-        if (!$instanceId) continue;
-        update_option('woocommerce_free_shipping_' . $instanceId . '_settings', [
-            'title' => 'Standard Shipping',
-            'requires' => '', // always available, no minimum-order/coupon condition
-        ]);
+    try {
+        $zoneIds = [0]; // zone 0 = the always-existing "Locations not covered by your other zones"
+        foreach (WC_Shipping_Zones::get_zones() as $zone) {
+            $zoneIds[] = $zone['id'];
+        }
+        foreach (array_unique($zoneIds) as $zoneId) {
+            $zone = new WC_Shipping_Zone($zoneId);
+            $existing = $zone->get_shipping_methods();
+            if (!empty($existing)) {
+                $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): already has " . count($existing) . ' method(s) - skipped.';
+                continue;
+            }
+            // Free Shipping, not a Flat Rate priced at 0 - "free" is unambiguous and
+            // has no cost field to accidentally edit later. Editing this method's
+            // cost would double-charge, since the real amount already lives in our
+            // own "Shipping" fee (aswb_apply_fees) - a Flat Rate with a $0 field
+            // sitting right there in wp-admin invites exactly that mistake.
+            $instanceId = $zone->add_shipping_method('free_shipping');
+            if (!$instanceId) {
+                $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): add_shipping_method('free_shipping') returned nothing - failed.";
+                continue;
+            }
+            $saved = update_option('woocommerce_free_shipping_' . $instanceId . '_settings', [
+                'title' => 'Standard Shipping',
+                'requires' => '',
+            ]);
+            $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): added Free Shipping, instance $instanceId, settings saved=" . ($saved ? 'yes' : 'no (already matched? or save failed)');
+        }
+    } catch (\Throwable $e) {
+        $log[] = 'Exception: ' . $e->getMessage();
     }
+    update_option('aswb_shipping_provision_log', $log);
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -108,6 +135,24 @@ function aswb_render_settings_page() {
         </table>
         <?php submit_button(); ?>
       </form>
+
+      <hr>
+      <h2>Shipping Method Provisioning</h2>
+      <p>Checkout requires a real shipping rate on any zone that needs shipping. This runs automatically once, but you can re-run it manually here (safe - it always skips a zone that already has a method).</p>
+      <?php if (isset($_GET['aswb_ran'])): ?>
+        <div class="notice notice-info"><p>Ran. See the log below.</p></div>
+      <?php endif; ?>
+      <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+        <input type="hidden" name="action" value="aswb_run_shipping_provisioning">
+        <?php wp_nonce_field('aswb_run_shipping_provisioning'); ?>
+        <?php submit_button('Run Shipping Provisioning Now', 'secondary'); ?>
+      </form>
+      <?php $log = get_option('aswb_shipping_provision_log'); if ($log): ?>
+        <p><strong>Last run result:</strong></p>
+        <ul style="list-style:disc; margin-left:20px;">
+          <?php foreach ($log as $line): ?><li><?php echo esc_html($line); ?></li><?php endforeach; ?>
+        </ul>
+      <?php endif; ?>
     </div>
     <?php
 }
