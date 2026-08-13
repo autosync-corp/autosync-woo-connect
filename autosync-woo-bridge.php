@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.3
+ * Version: 0.1.4
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -16,6 +16,45 @@
  */
 
 if (!defined('ABSPATH')) exit; // no direct access
+
+// ── Auto-provision a placeholder shipping method, on every zone missing one ─
+// Checkout requires a real shipping rate whenever an order needs shipping -
+// with zero methods configured anywhere, checkout fails outright ("this order
+// requires a shipping option"). The real shipping CHARGE is already computed
+// independently as our own "Shipping" fee (see aswb_apply_fees below) - this
+// only satisfies checkout's rate-selection requirement with a $0 flat rate,
+// customer-facing title just "Standard Shipping" (clean - the client manages
+// real orders/shipping through this same wp-admin, so nothing engineering-
+// internal should leak into what they or their customers see). Idempotent:
+// skips any zone that already has a method (including a developer's own
+// manually-configured zone), and only runs once per site via the option flag.
+register_activation_hook(__FILE__, 'aswb_provision_shipping_methods');
+add_action('admin_init', function () {
+    // register_activation_hook only fires on a fresh install, not a re-upload
+    // over an existing one - this catches that case on the next admin visit.
+    if (get_option('aswb_shipping_provisioned_v1')) return;
+    aswb_provision_shipping_methods();
+    update_option('aswb_shipping_provisioned_v1', 1);
+});
+
+function aswb_provision_shipping_methods() {
+    if (!class_exists('WC_Shipping_Zones') || !class_exists('WC_Shipping_Zone')) return;
+    $zoneIds = [0]; // zone 0 = the always-existing "Locations not covered by your other zones"
+    foreach (WC_Shipping_Zones::get_zones() as $zone) {
+        $zoneIds[] = $zone['id'];
+    }
+    foreach (array_unique($zoneIds) as $zoneId) {
+        $zone = new WC_Shipping_Zone($zoneId);
+        if (!empty($zone->get_shipping_methods())) continue; // already has a method - leave it alone
+        $instanceId = $zone->add_shipping_method('flat_rate');
+        if (!$instanceId) continue;
+        update_option('woocommerce_flat_rate_' . $instanceId . '_settings', [
+            'title' => 'Standard Shipping',
+            'tax_status' => 'none',
+            'cost' => '0',
+        ]);
+    }
+}
 
 // ── Configuration ────────────────────────────────────────────────────────────
 // API key and allowed origin are editable under Settings -> AutoSync Bridge in
