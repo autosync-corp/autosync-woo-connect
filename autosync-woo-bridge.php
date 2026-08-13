@@ -208,16 +208,25 @@ function aswb_maybe_send_cors_headers($route) {
 // which looks it up fresh against the live AutoSync API every time totals are
 // calculated. This filter only records which real item a generic product
 // represents (type/sku/brand/name/size/vehicle), all of it display-only.
-add_filter('woocommerce_store_api_add_to_cart_data', function ($cart_item_data, $request) {
-    $extensions = $request['extensions'] ?? [];
-    $data = is_array($extensions) ? ($extensions['autosync'] ?? null) : null;
+// $add_to_cart_data's real shape, confirmed directly against WooCommerce's
+// current source (CartAddItem.php): {id, quantity, variation, cart_item_data: []} -
+// custom data MUST be nested under ['cart_item_data'], not set at the top
+// level (an earlier draft of this got that wrong - caught via a real curl
+// test against the live site: item_data/extensions came back empty and the
+// price never got overridden, because this filter's return value was never
+// actually reaching the cart item). The request field itself is a plain
+// top-level JSON key (`autosync`), not nested under an "extensions" wrapper -
+// that wrapper is a different, response-side mechanism
+// (woocommerce_store_api_register_endpoint_data), unrelated to this filter.
+add_filter('woocommerce_store_api_add_to_cart_data', function ($add_to_cart_data, $request) {
+    $data = $request['autosync'] ?? null;
     if (!$data || empty($data['type']) || empty($data['sku']) || empty($data['brand'])) {
-        return $cart_item_data; // not an AutoSync item, or malformed - leave untouched
+        return $add_to_cart_data; // not an AutoSync item, or malformed - leave untouched
     }
     if (!in_array($data['type'], ['wheel', 'tire'], true)) {
-        return $cart_item_data; // only wheel/tire are catalog-verified against AutoSync
+        return $add_to_cart_data; // only wheel/tire are catalog-verified against AutoSync
     }
-    $cart_item_data['autosync'] = [
+    $add_to_cart_data['cart_item_data']['autosync'] = [
         'type' => sanitize_text_field($data['type']),
         'sku' => sanitize_text_field($data['sku']),
         'brand' => sanitize_text_field($data['brand']),
@@ -225,7 +234,7 @@ add_filter('woocommerce_store_api_add_to_cart_data', function ($cart_item_data, 
         'size' => sanitize_text_field($data['size'] ?? ''),
         'vehicle' => sanitize_text_field($data['vehicle'] ?? ''),
     ];
-    return $cart_item_data;
+    return $add_to_cart_data;
 }, 10, 2);
 
 // ── Verify price server-side and override the cart line - every calculation ─
