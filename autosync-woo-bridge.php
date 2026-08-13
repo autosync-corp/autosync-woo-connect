@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.8
+ * Version: 0.1.9
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -130,7 +130,40 @@ add_action('admin_menu', function () {
 add_action('admin_init', function () {
     register_setting('aswb_settings', 'aswb_autosync_api_key', ['sanitize_callback' => 'sanitize_text_field']);
     register_setting('aswb_settings', 'aswb_allowed_origin', ['sanitize_callback' => function ($v) { return rtrim(trim($v), '/'); }]);
+    register_setting('aswb_settings', 'aswb_fee_settings', ['sanitize_callback' => 'aswb_sanitize_fee_settings']);
 });
+
+// Every site's fee amounts/rules differ - same reasoning as the API key/
+// origin above, extended to cover the numbers that used to be hardcoded PHP
+// constants (and could silently drift out of sync with autosyncadmin's Fees
+// & Shipping card, which drives the exact same values on the Medusa side).
+function aswb_sanitize_fee_settings($raw) {
+    $raw = is_array($raw) ? $raw : [];
+    $overrides = [];
+    foreach (explode("\n", $raw['salesTaxStateOverridesText'] ?? '') as $line) {
+        $line = trim($line);
+        if ($line === '') continue;
+        $parts = explode(':', $line, 2);
+        if (count($parts) === 2 && trim($parts[0]) !== '') {
+            $overrides[strtoupper(trim($parts[0]))] = (float) trim($parts[1]);
+        }
+    }
+    return [
+        'mountBalanceEnabled' => !empty($raw['mountBalanceEnabled']),
+        'mountBalanceAmount' => (float) ($raw['mountBalanceAmount'] ?? 0),
+        'mountBalanceWaiver' => sanitize_text_field($raw['mountBalanceWaiver'] ?? 'never'),
+        'disposalEnabled' => !empty($raw['disposalEnabled']),
+        'disposalAmount' => (float) ($raw['disposalAmount'] ?? 0),
+        'disposalWaiver' => sanitize_text_field($raw['disposalWaiver'] ?? 'never'),
+        'shippingEnabled' => !empty($raw['shippingEnabled']),
+        'shippingAmount' => (float) ($raw['shippingAmount'] ?? 0),
+        'shippingWaiver' => sanitize_text_field($raw['shippingWaiver'] ?? 'never'),
+        'freeSetSize' => (float) ($raw['freeSetSize'] ?? 4),
+        'salesTaxEnabled' => !empty($raw['salesTaxEnabled']),
+        'salesTaxDefaultRate' => (float) ($raw['salesTaxDefaultRate'] ?? 0),
+        'salesTaxStateOverrides' => $overrides,
+    ];
+}
 
 function aswb_render_settings_page() {
     if (!current_user_can('manage_options')) return;
@@ -148,6 +181,56 @@ function aswb_render_settings_page() {
           <tr>
             <th><label for="aswb_allowed_origin">Allowed Frontend Origin</label></th>
             <td><input type="text" id="aswb_allowed_origin" name="aswb_allowed_origin" value="<?php echo esc_attr(aswb_get_allowed_origin()); ?>" class="regular-text" placeholder="https://www.example.com"></td>
+          </tr>
+        </table>
+
+        <h2>Fees &amp; Shipping</h2>
+        <p>Should match <code>autosyncadmin</code>'s "Fees &amp; Shipping" card exactly - both drive the same business rules, just for WooCommerce vs. Medusa orders respectively.</p>
+        <?php $fees = aswb_fee_settings(); $waiverModes = ['never' => 'Always charge', 'joint' => 'Waive for a full package', 'independent' => 'Waive per category independently', 'always' => 'Always free']; ?>
+        <table class="form-table">
+          <tr>
+            <th>Mount &amp; Balance</th>
+            <td>
+              <label><input type="checkbox" name="aswb_fee_settings[mountBalanceEnabled]" <?php checked($fees['mountBalanceEnabled']); ?>> Enabled</label>
+              &nbsp; $<input type="text" name="aswb_fee_settings[mountBalanceAmount]" value="<?php echo esc_attr($fees['mountBalanceAmount']); ?>" size="4"> per item
+              &nbsp; <select name="aswb_fee_settings[mountBalanceWaiver]"><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['mountBalanceWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
+            </td>
+          </tr>
+          <tr>
+            <th>Tire Disposal</th>
+            <td>
+              <label><input type="checkbox" name="aswb_fee_settings[disposalEnabled]" <?php checked($fees['disposalEnabled']); ?>> Enabled</label>
+              &nbsp; $<input type="text" name="aswb_fee_settings[disposalAmount]" value="<?php echo esc_attr($fees['disposalAmount']); ?>" size="4"> per tire
+              &nbsp; <select name="aswb_fee_settings[disposalWaiver]"><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['disposalWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
+            </td>
+          </tr>
+          <tr>
+            <th>Shipping</th>
+            <td>
+              <label><input type="checkbox" name="aswb_fee_settings[shippingEnabled]" <?php checked($fees['shippingEnabled']); ?>> Enabled</label>
+              &nbsp; $<input type="text" name="aswb_fee_settings[shippingAmount]" value="<?php echo esc_attr($fees['shippingAmount']); ?>" size="4"> per item
+              &nbsp; <select name="aswb_fee_settings[shippingWaiver]"><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['shippingWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
+            </td>
+          </tr>
+          <tr>
+            <th><label for="aswb_free_set_size">Free Set Size</label></th>
+            <td><input type="text" id="aswb_free_set_size" name="aswb_fee_settings[freeSetSize]" value="<?php echo esc_attr($fees['freeSetSize']); ?>" size="4"></td>
+          </tr>
+          <tr>
+            <th>Sales Tax</th>
+            <td>
+              <label><input type="checkbox" name="aswb_fee_settings[salesTaxEnabled]" <?php checked($fees['salesTaxEnabled']); ?>> Enabled</label>
+              &nbsp; Default rate: <input type="text" name="aswb_fee_settings[salesTaxDefaultRate]" value="<?php echo esc_attr($fees['salesTaxDefaultRate']); ?>" size="4">%
+            </td>
+          </tr>
+          <tr>
+            <th><label for="aswb_state_overrides">State Overrides</label></th>
+            <td>
+              <textarea id="aswb_state_overrides" name="aswb_fee_settings[salesTaxStateOverridesText]" rows="4" class="regular-text" placeholder="CA:7.25&#10;NY:8"><?php
+                foreach ($fees['salesTaxStateOverrides'] as $st => $rate) echo esc_textarea("$st:$rate") . "\n";
+              ?></textarea>
+              <p class="description">One per line, <code>STATE:RATE</code> - e.g. <code>CA:7.25</code>. Only add a line for states that differ from the default rate above.</p>
+            </td>
           </tr>
         </table>
         <?php submit_button(); ?>
@@ -183,22 +266,20 @@ define('ASWB_PRODUCT_WHEEL', 14307);
 define('ASWB_PRODUCT_TIRE', 14308);
 
 // Fee business rules - mirrors checkout/index.html's computeQtyFee logic
-// exactly. Edit these to match autosyncadmin's Fees & Shipping card.
-define('ASWB_FEE_MOUNT_BALANCE_ENABLED', true);
-define('ASWB_FEE_MOUNT_BALANCE_AMOUNT', 25);
-define('ASWB_FEE_MOUNT_BALANCE_WAIVER', 'independent'); // 'never' | 'joint' | 'independent' | 'always'
-define('ASWB_FEE_DISPOSAL_ENABLED', true);
-define('ASWB_FEE_DISPOSAL_AMOUNT', 3);
-define('ASWB_FEE_DISPOSAL_WAIVER', 'joint');
-define('ASWB_FEE_SHIPPING_ENABLED', true);
-define('ASWB_FEE_SHIPPING_AMOUNT', 50);
-define('ASWB_FEE_SHIPPING_WAIVER', 'independent');
-define('ASWB_FEE_FREE_SET_SIZE', 4);
-define('ASWB_FEE_SALES_TAX_ENABLED', true);
-define('ASWB_FEE_SALES_TAX_DEFAULT_RATE', 6);
-// Per-state overrides, e.g. ['CA' => 7.25] - keys uppercase, matched against
-// the state the frontend sends via the cart/extensions call below.
-define('ASWB_SALES_TAX_STATE_OVERRIDES', []);
+// exactly. Editable under Settings -> AutoSync Bridge (below), same reasoning
+// as the API key/origin: every site's numbers differ, and a developer
+// shouldn't have to edit PHP source (or keep it in sync with autosyncadmin's
+// Fees & Shipping card by hand) to change them.
+function aswb_fee_settings() {
+    return get_option('aswb_fee_settings', [
+        'mountBalanceEnabled' => true, 'mountBalanceAmount' => 25, 'mountBalanceWaiver' => 'independent',
+        'disposalEnabled' => true, 'disposalAmount' => 3, 'disposalWaiver' => 'joint',
+        'shippingEnabled' => true, 'shippingAmount' => 50, 'shippingWaiver' => 'independent',
+        'freeSetSize' => 4,
+        'salesTaxEnabled' => true, 'salesTaxDefaultRate' => 6,
+        'salesTaxStateOverrides' => [], // ['CA' => 7.25, ...] - uppercase state keys
+    ]);
+}
 
 // ── CORS: let the headless frontend call the Store API cross-origin ─────────
 // WooCommerce 9.8+ already exposes the Cart-Token response header for CORS
@@ -291,7 +372,8 @@ function aswb_apply_fees($cart) {
         if ($as['type'] === 'wheel') $wheelQty += $item['quantity'];
     }
 
-    $freeSetSize = ASWB_FEE_FREE_SET_SIZE;
+    $fees = aswb_fee_settings();
+    $freeSetSize = (float) $fees['freeSetSize'];
     $isPackage = $tireQty >= $freeSetSize && $wheelQty >= $freeSetSize;
 
     // Mirrors checkout/index.html's computeQtyFee() exactly - see that file's
@@ -312,9 +394,9 @@ function aswb_apply_fees($cart) {
 
     // Mount & Balance / Disposal are pickup-only services - unconditionally $0
     // for ship-mode regardless of waiverMode, same rule as the frontend.
-    $mount = $qtyFee(ASWB_FEE_MOUNT_BALANCE_ENABLED, ASWB_FEE_MOUNT_BALANCE_AMOUNT, ASWB_FEE_MOUNT_BALANCE_WAIVER, 'both', $mode !== 'ship');
-    $disposal = $qtyFee(ASWB_FEE_DISPOSAL_ENABLED, ASWB_FEE_DISPOSAL_AMOUNT, ASWB_FEE_DISPOSAL_WAIVER, 'tire', $mode !== 'ship');
-    $shipping = $qtyFee(ASWB_FEE_SHIPPING_ENABLED, ASWB_FEE_SHIPPING_AMOUNT, ASWB_FEE_SHIPPING_WAIVER, 'both', $mode === 'ship');
+    $mount = $qtyFee($fees['mountBalanceEnabled'], (float) $fees['mountBalanceAmount'], $fees['mountBalanceWaiver'], 'both', $mode !== 'ship');
+    $disposal = $qtyFee($fees['disposalEnabled'], (float) $fees['disposalAmount'], $fees['disposalWaiver'], 'tire', $mode !== 'ship');
+    $shipping = $qtyFee($fees['shippingEnabled'], (float) $fees['shippingAmount'], $fees['shippingWaiver'], 'both', $mode === 'ship');
 
     // Each fee is added non-taxable - sales tax below is our own flat-rate line,
     // not WooCommerce's tax engine, so these shouldn't also get taxed by it.
@@ -322,9 +404,10 @@ function aswb_apply_fees($cart) {
     if ($disposal > 0) $cart->add_fee('Tire Disposal', $disposal, false);
     if ($shipping > 0) $cart->add_fee('Shipping', $shipping, false);
 
-    if (ASWB_FEE_SALES_TAX_ENABLED) {
+    if ($fees['salesTaxEnabled']) {
         $subtotal = $cart->get_subtotal();
-        $rate = ASWB_SALES_TAX_STATE_OVERRIDES[$state] ?? ASWB_FEE_SALES_TAX_DEFAULT_RATE;
+        $overrides = $fees['salesTaxStateOverrides'] ?: [];
+        $rate = $overrides[$state] ?? (float) $fees['salesTaxDefaultRate'];
         $tax = round($subtotal * ($rate / 100), 2);
         if ($tax > 0) $cart->add_fee('Sales Tax', $tax, false);
     }
