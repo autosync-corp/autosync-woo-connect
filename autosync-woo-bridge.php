@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.4
+ * Version: 0.1.5
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -22,7 +22,7 @@ if (!defined('ABSPATH')) exit; // no direct access
 // with zero methods configured anywhere, checkout fails outright ("this order
 // requires a shipping option"). The real shipping CHARGE is already computed
 // independently as our own "Shipping" fee (see aswb_apply_fees below) - this
-// only satisfies checkout's rate-selection requirement with a $0 flat rate,
+// only satisfies checkout's rate-selection requirement with a Free Shipping method,
 // customer-facing title just "Standard Shipping" (clean - the client manages
 // real orders/shipping through this same wp-admin, so nothing engineering-
 // internal should leak into what they or their customers see). Idempotent:
@@ -32,9 +32,13 @@ register_activation_hook(__FILE__, 'aswb_provision_shipping_methods');
 add_action('admin_init', function () {
     // register_activation_hook only fires on a fresh install, not a re-upload
     // over an existing one - this catches that case on the next admin visit.
-    if (get_option('aswb_shipping_provisioned_v1')) return;
+    // v2: bumped from v1 (which used a Flat Rate placeholder, since replaced
+    // with Free Shipping) specifically so this runs again even on a site that
+    // already ran v1 - the "skip a zone with a method" guard below would
+    // otherwise leave the old Flat Rate method in place forever.
+    if (get_option('aswb_shipping_provisioned_v2')) return;
     aswb_provision_shipping_methods();
-    update_option('aswb_shipping_provisioned_v1', 1);
+    update_option('aswb_shipping_provisioned_v2', 1);
 });
 
 function aswb_provision_shipping_methods() {
@@ -46,12 +50,16 @@ function aswb_provision_shipping_methods() {
     foreach (array_unique($zoneIds) as $zoneId) {
         $zone = new WC_Shipping_Zone($zoneId);
         if (!empty($zone->get_shipping_methods())) continue; // already has a method - leave it alone
-        $instanceId = $zone->add_shipping_method('flat_rate');
+        // Free Shipping, not a Flat Rate priced at 0 - "free" is unambiguous and
+        // has no cost field to accidentally edit later. Editing this method's
+        // cost would double-charge, since the real amount already lives in our
+        // own "Shipping" fee (aswb_apply_fees) - a Flat Rate with a $0 field
+        // sitting right there in wp-admin invites exactly that mistake.
+        $instanceId = $zone->add_shipping_method('free_shipping');
         if (!$instanceId) continue;
-        update_option('woocommerce_flat_rate_' . $instanceId . '_settings', [
+        update_option('woocommerce_free_shipping_' . $instanceId . '_settings', [
             'title' => 'Standard Shipping',
-            'tax_status' => 'none',
-            'cost' => '0',
+            'requires' => '', // always available, no minimum-order/coupon condition
         ]);
     }
 }
