@@ -7,12 +7,12 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.0
+ * Version: 0.1.2
  *
- * Install: upload this file (or the whole plugin folder) into wp-content/plugins/
- * on the WordPress+WooCommerce site, then activate under Plugins in wp-admin.
- * Not yet installed/tested against the real site - verify each piece (CORS,
- * price lookup, cart-item display) before relying on it for a real order.
+ * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
+ * then Activate (or re-upload over an existing install - WordPress offers to
+ * replace it). Check the Version number above/in the Plugins list after
+ * uploading to confirm the new copy actually took - bump it on every edit.
  */
 
 if (!defined('ABSPATH')) exit; // no direct access
