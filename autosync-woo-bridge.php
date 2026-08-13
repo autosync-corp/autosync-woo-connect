@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.9
+ * Version: 0.2.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -130,6 +130,12 @@ add_action('admin_menu', function () {
 add_action('admin_init', function () {
     register_setting('aswb_settings', 'aswb_autosync_api_key', ['sanitize_callback' => 'sanitize_text_field']);
     register_setting('aswb_settings', 'aswb_allowed_origin', ['sanitize_callback' => function ($v) { return rtrim(trim($v), '/'); }]);
+    register_setting('aswb_settings', 'aswb_core_site_url', [
+        'sanitize_callback' => function ($v) {
+            delete_transient('aswb_fee_settings_live'); // force a fresh fetch next time, don't serve a stale cache against a newly-changed URL
+            return rtrim(trim($v), '/');
+        },
+    ]);
     register_setting('aswb_settings', 'aswb_fee_settings', ['sanitize_callback' => 'aswb_sanitize_fee_settings']);
 });
 
@@ -182,10 +188,17 @@ function aswb_render_settings_page() {
             <th><label for="aswb_allowed_origin">Allowed Frontend Origin</label></th>
             <td><input type="text" id="aswb_allowed_origin" name="aswb_allowed_origin" value="<?php echo esc_attr(aswb_get_allowed_origin()); ?>" class="regular-text" placeholder="https://www.example.com"></td>
           </tr>
+          <tr>
+            <th><label for="aswb_core_site_url">Core Site URL</label></th>
+            <td>
+              <input type="text" id="aswb_core_site_url" name="aswb_core_site_url" value="<?php echo esc_attr(get_option('aswb_core_site_url', '')); ?>" class="regular-text" placeholder="https://devcore.autosynccorp.com">
+              <p class="description">The core site's own URL (not this WordPress site). When set, fee/shipping/tax values below are fetched live from <code>{this URL}/fee-config.php</code> and cached for 10 minutes - <code>autosyncadmin</code> becomes the real source of truth. Leave blank to always use the values below directly.</p>
+            </td>
+          </tr>
         </table>
 
-        <h2>Fees &amp; Shipping</h2>
-        <p>Should match <code>autosyncadmin</code>'s "Fees &amp; Shipping" card exactly - both drive the same business rules, just for WooCommerce vs. Medusa orders respectively.</p>
+        <h2>Fees &amp; Shipping <span style="font-weight:normal; font-size:13px; color:#666;">(fallback values - only used if Core Site URL above is blank, or the live fetch fails)</span></h2>
+        <p>Should match <code>autosyncadmin</code>'s "Fees &amp; Shipping" card - both drive the same business rules, just for WooCommerce vs. Medusa orders respectively. If a Core Site URL is set above, these are a safety net only.</p>
         <?php $fees = aswb_fee_settings(); $waiverModes = ['never' => 'Always charge', 'joint' => 'Waive for a full package', 'independent' => 'Waive per category independently', 'always' => 'Always free']; ?>
         <table class="form-table">
           <tr>
@@ -266,12 +279,15 @@ define('ASWB_PRODUCT_WHEEL', 14307);
 define('ASWB_PRODUCT_TIRE', 14308);
 
 // Fee business rules - mirrors checkout/index.html's computeQtyFee logic
-// exactly. Editable under Settings -> AutoSync Bridge (below), same reasoning
-// as the API key/origin: every site's numbers differ, and a developer
-// shouldn't have to edit PHP source (or keep it in sync with autosyncadmin's
-// Fees & Shipping card by hand) to change them.
+// exactly. autosyncadmin (on the core site) is the single source of truth -
+// this fetches the live values from fee-config.php on every call (cached
+// briefly so a cart calculation never waits on a slow/down request), and only
+// falls back to the locally-saved copy (editable under Settings -> AutoSync
+// Bridge, below) if the core site is unreachable. The local copy is a safety
+// net, not a second real source - keep it roughly in sync manually, but it
+// only ever matters when the fetch itself fails.
 function aswb_fee_settings() {
-    return get_option('aswb_fee_settings', [
+    $fallback = get_option('aswb_fee_settings', [
         'mountBalanceEnabled' => true, 'mountBalanceAmount' => 25, 'mountBalanceWaiver' => 'independent',
         'disposalEnabled' => true, 'disposalAmount' => 3, 'disposalWaiver' => 'joint',
         'shippingEnabled' => true, 'shippingAmount' => 50, 'shippingWaiver' => 'independent',
@@ -279,6 +295,23 @@ function aswb_fee_settings() {
         'salesTaxEnabled' => true, 'salesTaxDefaultRate' => 6,
         'salesTaxStateOverrides' => [], // ['CA' => 7.25, ...] - uppercase state keys
     ]);
+
+    $coreUrl = rtrim(get_option('aswb_core_site_url', ''), '/');
+    if ($coreUrl === '') return $fallback;
+
+    $cached = get_transient('aswb_fee_settings_live');
+    if ($cached !== false) return $cached;
+
+    $url = $coreUrl . '/fee-config.php?' . http_build_query(['key' => aswb_get_api_key()]);
+    $response = wp_remote_get($url, ['timeout' => 5]);
+    if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+        return $fallback; // core site unreachable/misconfigured - don't cache a failure, just use the fallback for this one calculation
+    }
+    $live = json_decode(wp_remote_retrieve_body($response), true);
+    if (!is_array($live) || !isset($live['mountBalanceAmount'])) return $fallback;
+
+    set_transient('aswb_fee_settings_live', $live, 10 * MINUTE_IN_SECONDS);
+    return $live;
 }
 
 // ── CORS: let the headless frontend call the Store API cross-origin ─────────
