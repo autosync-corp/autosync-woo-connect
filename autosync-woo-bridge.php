@@ -262,6 +262,7 @@ function aswb_verify_cart_prices($cart) {
 
 function aswb_lookup_real_price($type, $brand, $sku) {
     $endpoint = $type === 'tire' ? '/tires' : '/wheels';
+    $listKey = $type === 'tire' ? 'Tires' : 'Wheels'; // response is {"MoreItems":..., "Tires"/"Wheels": [...]}, not a bare array - confirmed via direct curl, not assumed
     $url = ASWB_AUTOSYNC_API_BASE . $endpoint . '?' . http_build_query([
         'key' => aswb_get_api_key(),
         'f-pn' => $sku,
@@ -270,8 +271,9 @@ function aswb_lookup_real_price($type, $brand, $sku) {
     ]);
     $response = wp_remote_get($url, ['timeout' => 8]);
     if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) return null;
-    $items = json_decode(wp_remote_retrieve_body($response), true);
-    if (!is_array($items) || empty($items[0]['Price'])) return null;
+    $body = json_decode(wp_remote_retrieve_body($response), true);
+    $items = is_array($body) ? ($body[$listKey] ?? []) : [];
+    if (empty($items[0]['Price'])) return null;
     return (float) $items[0]['Price'];
 }
 
