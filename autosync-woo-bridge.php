@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.6
+ * Version: 0.1.7
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -169,7 +169,7 @@ define('ASWB_PRODUCT_TIRE', 14308);
 // exactly. Edit these to match autosyncadmin's Fees & Shipping card.
 define('ASWB_FEE_MOUNT_BALANCE_ENABLED', true);
 define('ASWB_FEE_MOUNT_BALANCE_AMOUNT', 25);
-define('ASWB_FEE_MOUNT_BALANCE_WAIVER', 'independent'); // 'never' | 'joint' | 'independent'
+define('ASWB_FEE_MOUNT_BALANCE_WAIVER', 'independent'); // 'never' | 'joint' | 'independent' | 'always'
 define('ASWB_FEE_DISPOSAL_ENABLED', true);
 define('ASWB_FEE_DISPOSAL_AMOUNT', 3);
 define('ASWB_FEE_DISPOSAL_WAIVER', 'joint');
@@ -280,7 +280,7 @@ function aswb_apply_fees($cart) {
     // Mirrors checkout/index.html's computeQtyFee() exactly - see that file's
     // comment for what each waiverMode/applyTo combination means.
     $qtyFee = function ($enabled, $amount, $waiverMode, $applyTo, $applies) use ($tireQty, $wheelQty, $freeSetSize, $isPackage) {
-        if (!$enabled || !$applies) return 0;
+        if (!$enabled || !$applies || $waiverMode === 'always') return 0;
         if ($waiverMode === 'independent') {
             if ($applyTo === 'both') {
                 return ($tireQty >= $freeSetSize ? 0 : $tireQty * $amount) + ($wheelQty >= $freeSetSize ? 0 : $wheelQty * $amount);
