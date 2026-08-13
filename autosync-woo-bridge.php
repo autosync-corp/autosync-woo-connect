@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.2
+ * Version: 0.1.3
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -110,6 +110,34 @@ add_action('init', function () {
         status_header(200);
         exit;
     }
+});
+
+// ── Expose the real AutoSync item as clean structured JSON per cart item ────
+// woocommerce_get_item_data (further down) already shows this as human-
+// readable strings for the cart/checkout page's own display - this is the
+// same data again, but as real JSON under item.extensions.autosync, for the
+// frontend to rebuild its own cart state from without parsing display text.
+add_action('woocommerce_blocks_loaded', function () {
+    if (!function_exists('woocommerce_store_api_register_endpoint_data')) return;
+    if (!class_exists('\Automattic\WooCommerce\StoreApi\Schemas\V1\CartItemSchema')) return;
+    woocommerce_store_api_register_endpoint_data([
+        'endpoint' => \Automattic\WooCommerce\StoreApi\Schemas\V1\CartItemSchema::IDENTIFIER,
+        'namespace' => 'autosync',
+        'data_callback' => function ($cart_item) {
+            return $cart_item['autosync'] ?? null;
+        },
+        'schema_callback' => function () {
+            return [
+                'type' => ['type' => ['string', 'null']],
+                'sku' => ['type' => ['string', 'null']],
+                'brand' => ['type' => ['string', 'null']],
+                'name' => ['type' => ['string', 'null']],
+                'size' => ['type' => ['string', 'null']],
+                'vehicle' => ['type' => ['string', 'null']],
+            ];
+        },
+        'schema_type' => ARRAY_A,
+    ]);
 });
 
 // ── Receive delivery mode + resolved state from the frontend ────────────────
