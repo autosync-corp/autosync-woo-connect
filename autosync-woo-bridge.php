@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.1.7
+ * Version: 0.1.8
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -65,8 +65,24 @@ function aswb_provision_shipping_methods() {
         foreach (array_unique($zoneIds) as $zoneId) {
             $zone = new WC_Shipping_Zone($zoneId);
             $existing = $zone->get_shipping_methods();
+            $enabledCount = 0;
+            foreach ($existing as $m) {
+                $isEnabled = method_exists($m, 'is_enabled') ? $m->is_enabled() : ($m->enabled === 'yes');
+                if ($isEnabled) $enabledCount++;
+            }
+            if ($enabledCount > 0) {
+                $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): already has $enabledCount enabled method(s) - skipped.";
+                continue;
+            }
             if (!empty($existing)) {
-                $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): already has " . count($existing) . ' method(s) - skipped.';
+                // A method exists (probably our own earlier attempt) but none are
+                // enabled - WooCommerce doesn't default a newly-added instance to
+                // enabled, and the earlier version of this function never set it
+                // explicitly. Enable the first one instead of adding a duplicate.
+                $m = reset($existing);
+                update_option('woocommerce_' . $m->id . '_' . $m->instance_id . '_settings',
+                    array_merge($m->instance_settings, ['enabled' => 'yes', 'title' => 'Standard Shipping']));
+                $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): found a disabled method (instance {$m->instance_id}) - enabled it.";
                 continue;
             }
             // Free Shipping, not a Flat Rate priced at 0 - "free" is unambiguous and
@@ -82,6 +98,7 @@ function aswb_provision_shipping_methods() {
             $saved = update_option('woocommerce_free_shipping_' . $instanceId . '_settings', [
                 'title' => 'Standard Shipping',
                 'requires' => '',
+                'enabled' => 'yes',
             ]);
             $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): added Free Shipping, instance $instanceId, settings saved=" . ($saved ? 'yes' : 'no (already matched? or save failed)');
         }
