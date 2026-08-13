@@ -17,12 +17,53 @@
 
 if (!defined('ABSPATH')) exit; // no direct access
 
-// ── Configuration - edit these for this deployment ──────────────────────────
-// Must match window.AUTOSYNC_CONFIG.apiKey on the frontend.
-define('ASWB_AUTOSYNC_API_KEY', 'MFCtst');
+// ── Configuration ────────────────────────────────────────────────────────────
+// API key and allowed origin are editable under Settings -> AutoSync Bridge in
+// wp-admin (see the settings page below) - no code edit/re-upload needed to
+// change deployments, just the two things every install actually differs on.
 define('ASWB_AUTOSYNC_API_BASE', 'https://api.autosyncstudio.com');
-// The customer-facing frontend origin - exact match, no wildcard, no trailing slash.
-define('ASWB_ALLOWED_ORIGIN', 'https://devcore.autosynccorp.com');
+
+function aswb_get_api_key() {
+    return get_option('aswb_autosync_api_key', 'MFCtst');
+}
+
+function aswb_get_allowed_origin() {
+    return get_option('aswb_allowed_origin', 'https://devcore.autosynccorp.com');
+}
+
+// ── Settings page: Settings -> AutoSync Bridge ──────────────────────────────
+add_action('admin_menu', function () {
+    add_options_page('AutoSync Bridge', 'AutoSync Bridge', 'manage_options', 'aswb-settings', 'aswb_render_settings_page');
+});
+
+add_action('admin_init', function () {
+    register_setting('aswb_settings', 'aswb_autosync_api_key', ['sanitize_callback' => 'sanitize_text_field']);
+    register_setting('aswb_settings', 'aswb_allowed_origin', ['sanitize_callback' => function ($v) { return rtrim(trim($v), '/'); }]);
+});
+
+function aswb_render_settings_page() {
+    if (!current_user_can('manage_options')) return;
+    ?>
+    <div class="wrap">
+      <h1>AutoSync Bridge</h1>
+      <p>Must match this deployment's frontend exactly - <code>window.AUTOSYNC_CONFIG.apiKey</code> for the API key, and the real customer-facing origin for the allowed origin (e.g. <code>http://localhost:8080</code> while testing locally, the real production domain once deployed).</p>
+      <form method="post" action="options.php">
+        <?php settings_fields('aswb_settings'); ?>
+        <table class="form-table">
+          <tr>
+            <th><label for="aswb_autosync_api_key">AutoSync API Key</label></th>
+            <td><input type="text" id="aswb_autosync_api_key" name="aswb_autosync_api_key" value="<?php echo esc_attr(aswb_get_api_key()); ?>" class="regular-text"></td>
+          </tr>
+          <tr>
+            <th><label for="aswb_allowed_origin">Allowed Frontend Origin</label></th>
+            <td><input type="text" id="aswb_allowed_origin" name="aswb_allowed_origin" value="<?php echo esc_attr(aswb_get_allowed_origin()); ?>" class="regular-text" placeholder="https://www.example.com"></td>
+          </tr>
+        </table>
+        <?php submit_button(); ?>
+      </form>
+    </div>
+    <?php
+}
 
 // The generic hidden WooCommerce products created for this deployment. Only
 // Wheel/Tire are used as real cart items - Disposal/Mount & Balance/Sales Tax
@@ -155,7 +196,7 @@ function aswb_apply_fees($cart) {
 function aswb_maybe_send_cors_headers($route) {
     if (strpos($route, '/wc/store/') === false) return;
     $origin = get_http_origin();
-    if (!$origin || $origin !== ASWB_ALLOWED_ORIGIN) return;
+    if (!$origin || $origin !== aswb_get_allowed_origin()) return;
     header('Access-Control-Allow-Origin: ' . $origin);
     header('Access-Control-Allow-Credentials: true');
     header('Access-Control-Allow-Headers: Content-Type, X-WC-Store-API-Nonce, Cart-Token');
@@ -213,7 +254,7 @@ function aswb_verify_cart_prices($cart) {
 function aswb_lookup_real_price($type, $brand, $sku) {
     $endpoint = $type === 'tire' ? '/tires' : '/wheels';
     $url = ASWB_AUTOSYNC_API_BASE . $endpoint . '?' . http_build_query([
-        'key' => ASWB_AUTOSYNC_API_KEY,
+        'key' => aswb_get_api_key(),
         'f-pn' => $sku,
         'f-brand' => $brand,
         'i-price' => 'true',
