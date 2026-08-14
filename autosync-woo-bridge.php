@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.2.2
+ * Version: 0.3.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -418,14 +418,10 @@ add_action('woocommerce_blocks_loaded', function () {
             if (array_key_exists('state', $data)) {
                 WC()->session->set('autosync_state', strtoupper(sanitize_text_field((string) $data['state'])));
             }
-            // Deposit percentage for THIS checkout (100 = full payment) - the
-            // frontend is the source of truth for what it already promised the
-            // customer (e.g. "$604 today"), so it's carried through rather than
-            // re-derived server-side from a second hardcoded copy of the same rule.
-            if (isset($data['depositPct']) && is_numeric($data['depositPct'])) {
-                $pct = (float) $data['depositPct'];
-                WC()->session->set('autosync_deposit_pct', max(1, min(100, $pct)));
-            }
+            // Deliberately no depositPct here - eligibility and the actual
+            // percentage charged are decided entirely server-side (see
+            // ASWB_DEPOSIT_PCT below), never accepted from the client. A raw
+            // API call must not be able to influence what gets charged.
         },
     ]);
 });
@@ -492,60 +488,214 @@ function aswb_apply_fees($cart) {
     }
 }
 
-// ── Deposit checkout: charge only depositPct% of the order via Stripe ───────
-// "Install at Your Tire Shop" promises "25% today, rest at install" - the
-// WooCommerce order itself still totals the full amount (correct for
-// inventory/accounting), but the real Stripe charge needs to match what the
-// checkout page actually told the customer, not the full order total.
-// The frontend's real depositPct rides along the same autosync-fees cart
-// extension as mode/state (see the update-callback above) - carried into
-// order meta here, at order-creation time, since the cart session is gone
-// by the time the payment gateway builds its Stripe PaymentIntent args.
-add_action('woocommerce_checkout_create_order', function ($order, $data) {
-    $pct = WC()->session ? (float) WC()->session->get('autosync_deposit_pct', 100) : 100;
-    if ($pct > 0 && $pct < 100) {
-        $order->update_meta_data('_autosync_deposit_pct', $pct);
+// ── Deposit checkout: parent (full-value) order + child (deposit) order ────
+// "Install at Your Tire Shop" promises "25% today, rest at install" (matches
+// the existing Medusa checkout's real deposit charge). WooCommerce assumes
+// order total == amount charged, so simply filtering the Stripe charge
+// amount on a full-value order would leave Woo's own refund button, sales
+// reports, and payment reconciliation believing the full amount was
+// collected. Instead: the customer's real order (parent) keeps its full
+// total untouched; a second, internal child order carrying only the
+// deposit amount is what Stripe actually charges. Reviewed and revised
+// twice against real WooCommerce/Store API source before building - see
+// project memory for the full design discussion.
+//
+// Percentage/eligibility are decided ENTIRELY here, never trusted from the
+// frontend - a raw API call cannot influence what gets charged.
+define('ASWB_DEPOSIT_PCT', 25);
+
+// ── Expose deposit info to the frontend for DISPLAY only (never authoritative
+// for charging) - same mechanism already used for per-item autosync data,
+// just registered on the cart schema instead of the per-item schema.
+add_action('woocommerce_blocks_loaded', function () {
+    if (!function_exists('woocommerce_store_api_register_endpoint_data')) return;
+    if (!class_exists('\Automattic\WooCommerce\StoreApi\Schemas\V1\CartSchema')) return;
+    woocommerce_store_api_register_endpoint_data([
+        'endpoint' => \Automattic\WooCommerce\StoreApi\Schemas\V1\CartSchema::IDENTIFIER,
+        'namespace' => 'autosync_deposit',
+        'data_callback' => function () {
+            // Only 'install' vs 'ship' is known at cart stage (WooCommerce mode
+            // only ever offers card/stripe_cc for this cart module - see
+            // checkout/index.html's payment-method gating), so mode alone is a
+            // sufficient eligibility proxy for display purposes here.
+            $mode = WC()->session ? WC()->session->get('autosync_mode', 'install') : 'install';
+            $eligible = $mode === 'install';
+            $fullTotal = (float) WC()->cart->get_total('edit');
+            $due = $eligible ? round($fullTotal * (ASWB_DEPOSIT_PCT / 100), 2) : $fullTotal;
+            return [
+                'eligible' => $eligible,
+                'percentage' => $eligible ? ASWB_DEPOSIT_PCT : 100,
+                'full_total' => $fullTotal,
+                'due_today' => $due,
+                'balance_due' => round($fullTotal - $due, 2),
+            ];
+        },
+        'schema_callback' => function () {
+            return [
+                'eligible' => ['type' => 'boolean'],
+                'percentage' => ['type' => 'number'],
+                'full_total' => ['type' => 'number'],
+                'due_today' => ['type' => 'number'],
+                'balance_due' => ['type' => 'number'],
+            ];
+        },
+        'schema_type' => ARRAY_A,
+    ]);
+});
+
+// ── Priority 5 (before Stripe, which hooks the same action at priority 10 -
+// confirmed directly against the installed woo-stripe-payment plugin's own
+// source): prepare the deposit child order and swap PaymentContext to it.
+// PaymentContext::set_order() only changes what THIS context points to -
+// Checkout.php builds its API response from its own separate $this->order
+// property (confirmed against WooCommerce core source), which still refers
+// to the parent - so the "order" field in the checkout response stays the
+// parent automatically, with no extra code needed for that part.
+add_action('woocommerce_rest_checkout_process_payment_with_context', 'aswb_prepare_deposit_child', 5, 2);
+function aswb_prepare_deposit_child($context, &$result) {
+    $parent = $context->order;
+    if (!($parent instanceof WC_Order)) return;
+
+    $mode = WC()->session ? WC()->session->get('autosync_mode', 'install') : 'install';
+    // $context->payment_method is WooCommerce's own authoritative record of the
+    // chosen gateway - never a frontend-supplied label.
+    $eligible = ($mode === 'install') && ($context->payment_method === 'stripe_cc');
+    if (!$eligible) return;
+
+    $depositAmount = round((float) $parent->get_total() * (ASWB_DEPOSIT_PCT / 100), 2);
+
+    // Idempotent: a retry (double-click, network retry, a prior failed
+    // attempt) reuses the existing pending/failed child instead of creating
+    // a new one every time - Store API supports retrying a checkout order.
+    $childId = (int) $parent->get_meta('_autosync_deposit_order_id');
+    $child = $childId ? wc_get_order($childId) : false;
+    if (!$child || !$child->has_status(['pending', 'failed'])) {
+        $child = new WC_Order();
+        $child->set_parent_id($parent->get_id());
+        $child->set_customer_id($parent->get_customer_id());
+        $child->set_currency($parent->get_currency());
+        foreach (['first_name', 'last_name', 'email', 'phone', 'address_1', 'address_2', 'city', 'state', 'postcode', 'country'] as $f) {
+            $getter = 'get_billing_' . $f;
+            $setter = 'set_billing_' . $f;
+            $child->$setter($parent->$getter());
+        }
+        $child->set_payment_method($context->payment_method);
+        $gateways = WC()->payment_gateways() ? WC()->payment_gateways()->payment_gateways() : [];
+        $child->set_payment_method_title(isset($gateways[$context->payment_method]) ? $gateways[$context->payment_method]->get_title() : $context->payment_method);
+        $child->update_meta_data('_autosync_deposit_payment', 'yes');
+        $child->update_meta_data('_autosync_parent_order_id', $parent->get_id());
+
+        // A real fee line, not a bare set_total() - keeps the child a
+        // coherent order for admin inspection/refunds, and deliberately NOT
+        // attached to the generic Wheel/Tire products so it can never affect
+        // their stock or sales reporting.
+        $fee = new WC_Order_Item_Fee();
+        $fee->set_name(ASWB_DEPOSIT_PCT . '% Deposit for Order #' . $parent->get_order_number());
+        $fee->set_amount($depositAmount);
+        $fee->set_total($depositAmount);
+        $fee->set_tax_status('none');
+        $child->add_item($fee);
+        $child->calculate_totals(false);
+        $child->set_status('pending');
+        $child->save();
+
+        $parent->update_meta_data('_autosync_deposit_order_id', $child->get_id());
+        $parent->update_meta_data('_autosync_full_total', (float) $parent->get_total());
+        $parent->update_meta_data('_autosync_deposit_amount', $depositAmount);
+        $parent->update_meta_data('_autosync_balance_due', round((float) $parent->get_total() - $depositAmount, 2));
+        $parent->save();
     }
-}, 10, 2);
 
-// wc_stripe_payment_intent_args is the woo-stripe-payment plugin's own real
-// filter (confirmed directly against its source, not assumed) - it wraps the
-// exact args sent to Stripe's PaymentIntent create/confirm call, defaulting
-// amount to $order->get_total(). Overriding it here is the only way to charge
-// less than the full order total without forking that plugin.
-add_filter('wc_stripe_payment_intent_args', function ($args, $order) {
-    $pct = (float) $order->get_meta('_autosync_deposit_pct');
-    if ($pct <= 0 || $pct >= 100 || !function_exists('wc_stripe_add_number_precision')) return $args;
-    $deposit = round((float) $order->get_total() * ($pct / 100), 2);
-    $args['amount'] = wc_stripe_add_number_precision($deposit, $order->get_currency());
-    $order->update_meta_data('_autosync_deposit_amount', $deposit);
-    $order->update_meta_data('_autosync_balance_due', round((float) $order->get_total() - $deposit, 2));
-    $order->save();
-    return $args;
-}, 10, 3);
+    $context->set_order($child);
+}
 
-// A deposit order that just had its (partial) charge succeed would otherwise
-// get WooCommerce's normal "processing"/"completed" status via
-// $order->payment_complete() - misleading for staff, since it looks fully
-// paid when only the deposit came in. Force "on-hold" instead, and leave a
-// clear note with the real numbers so staff see it directly on the order.
-add_filter('woocommerce_payment_complete_order_status', function ($status, $order_id, $order) {
-    $pct = $order ? (float) $order->get_meta('_autosync_deposit_pct') : 0;
-    return ($pct > 0 && $pct < 100) ? 'on-hold' : $status;
-}, 10, 3);
+// ── Priority 20 (after Stripe has processed the child at priority 10): the
+// customer-facing frontend lives on a different (sub)domain than this
+// WooCommerce install, so the customer must never be sent to WooCommerce's
+// own order-received page - only to our own headless confirmation route,
+// using the PARENT order's id/key.
+add_action('woocommerce_rest_checkout_process_payment_with_context', 'aswb_fix_deposit_redirect', 20, 2);
+function aswb_fix_deposit_redirect($context, &$result) {
+    $child = $context->order;
+    if (!($child instanceof WC_Order) || $child->get_meta('_autosync_deposit_payment') !== 'yes') return;
+    $parentId = (int) $child->get_meta('_autosync_parent_order_id');
+    $parent = $parentId ? wc_get_order($parentId) : false;
+    if (!$parent) return;
+    $frontendUrl = rtrim(aswb_get_allowed_origin(), '/');
+    if ($frontendUrl && method_exists($result, 'set_redirect_url')) {
+        $result->set_redirect_url($frontendUrl . '/checkout/?confirmed=1&order=' . $parent->get_id() . '&key=' . $parent->get_order_key());
+    }
+}
 
-add_action('woocommerce_payment_complete', function ($order_id) {
-    $order = wc_get_order($order_id);
-    if (!$order) return;
-    $pct = (float) $order->get_meta('_autosync_deposit_pct');
-    if ($pct <= 0 || $pct >= 100) return;
-    $deposit = (float) $order->get_meta('_autosync_deposit_amount');
-    $balance = (float) $order->get_meta('_autosync_balance_due');
-    $order->add_order_note(sprintf(
-        'Deposit checkout: $%s (%s%%) charged via Stripe today. $%s balance due at install - collect separately, this plugin does not charge it automatically.',
-        number_format($deposit, 2), rtrim(rtrim(number_format($pct, 1), '0'), '.'), number_format($balance, 2)
+// ── Authoritative parent sync - independent of the checkout request itself,
+// so 3DS/webhook-delayed completions are handled the same as the synchronous
+// path. Stock reservation and coupon holds happen against the PARENT at
+// checkout time (confirmed against WooCommerce core - Checkout.php reserves
+// stock/holds coupons on $this->order before payment ever runs), but the
+// CHILD is what receives payment_complete() - so finalize both explicitly on
+// the parent here. Both helper functions already no-op safely on their own
+// (wc_reduce_stock_levels skips non-stock-managed products entirely -
+// intentional for the generic Wheel/Tire placeholders, whose real inventory
+// lives in AutoSync, not WooCommerce; wc_update_coupon_usage_counts has its
+// own recorded-usage guard) - no extra idempotency needed here.
+add_action('woocommerce_payment_complete', 'aswb_sync_parent_on_deposit_paid', 20, 1);
+function aswb_sync_parent_on_deposit_paid($order_id) {
+    $child = wc_get_order($order_id);
+    if (!$child || $child->get_meta('_autosync_deposit_payment') !== 'yes') return;
+    $parentId = (int) $child->get_meta('_autosync_parent_order_id');
+    $parent = $parentId ? wc_get_order($parentId) : false;
+    if (!$parent) return;
+
+    wc_reduce_stock_levels($parent->get_id());
+    wc_update_coupon_usage_counts($parent->get_id());
+
+    // Never $parent->payment_complete() - that records a payment date/
+    // transaction and pushes toward Woo's normal "fully paid" semantics,
+    // which is wrong here: only the child actually collected money.
+    if (!$parent->has_status('aswb-deposit-paid')) {
+        $parent->update_status('aswb-deposit-paid', '');
+    }
+    $parent->add_order_note(sprintf(
+        'Deposit checkout: $%s charged via Stripe (Order #%s). $%s balance due at install - collect separately, this plugin does not charge it automatically.',
+        number_format((float) $parent->get_meta('_autosync_deposit_amount'), 2),
+        $child->get_order_number(),
+        number_format((float) $parent->get_meta('_autosync_balance_due'), 2)
     ));
-}, 20);
+}
+
+// ── Register the "Deposit Paid" order status - a real, dedicated status
+// rather than repurposing an existing one, so it's never confused with a
+// fully-paid order in the orders list, reports, or automation.
+add_action('init', function () {
+    register_post_status('wc-aswb-deposit-paid', [
+        'label' => 'Deposit Paid',
+        'public' => false,
+        'exclude_from_search' => false,
+        'show_in_admin_all_list' => true,
+        'show_in_admin_status_list' => true,
+        'label_count' => ['Deposit Paid <span class="count">(%s)</span>', 'Deposit Paid <span class="count">(%s)</span>'],
+    ]);
+});
+add_filter('wc_order_statuses', function ($statuses) {
+    $statuses['wc-aswb-deposit-paid'] = 'Deposit Paid';
+    return $statuses;
+});
+
+// ── Deposit child orders are an internal payment/accounting artifact, not
+// something a customer should ever see - hide from My Account order history
+// and skip customer-facing notification emails. Fully visible to staff in
+// wp-admin (Orders list, refunds) for audit purposes.
+add_filter('woocommerce_my_account_my_orders_query', function ($args) {
+    $args['meta_query'] = $args['meta_query'] ?? [];
+    $args['meta_query'][] = ['key' => '_autosync_deposit_payment', 'compare' => 'NOT EXISTS'];
+    return $args;
+});
+foreach (['new_order', 'customer_processing_order', 'customer_completed_order', 'customer_on_hold_order', 'customer_invoice'] as $aswbEmailId) {
+    add_filter("woocommerce_email_enabled_{$aswbEmailId}", function ($enabled, $order) {
+        if ($order instanceof WC_Order && $order->get_meta('_autosync_deposit_payment') === 'yes') return false;
+        return $enabled;
+    }, 10, 2);
+}
 
 function aswb_maybe_send_cors_headers($route) {
     if (strpos($route, '/wc/store/') === false) return;
