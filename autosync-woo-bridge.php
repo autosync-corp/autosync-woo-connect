@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.3.1
+ * Version: 0.3.2
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -277,9 +277,10 @@ function aswb_render_settings_page() {
         <?php submit_button('Clear Log', 'secondary', 'submit', false); ?>
       </form>
       <?php $priceLog = get_option('aswb_price_debug_log', []); if ($priceLog): ?>
-        <table class="widefat striped" style="max-width:900px;">
-          <thead><tr><th>Time</th><th>Run</th><th>Event</th><th>Product ID</th><th>Type</th><th>Brand</th><th>SKU</th><th>Price set</th></tr></thead>
+        <table class="widefat striped" style="max-width:1400px;">
+          <thead><tr><th>Time</th><th>Run</th><th>Event</th><th>Product ID</th><th>Type</th><th>Brand</th><th>SKU</th><th>Price set</th><th>Other fields</th></tr></thead>
           <tbody>
+            <?php $knownKeys = ['time', 'run', 'event', 'product_id', 'type', 'brand', 'sku', 'price_set']; ?>
             <?php foreach ($priceLog as $row): ?>
               <tr>
                 <td><?php echo esc_html($row['time'] ?? ''); ?></td>
@@ -290,6 +291,10 @@ function aswb_render_settings_page() {
                 <td><?php echo esc_html($row['brand'] ?? ''); ?></td>
                 <td><?php echo esc_html($row['sku'] ?? ''); ?></td>
                 <td><?php echo isset($row['price_set']) ? esc_html('$' . number_format((float) $row['price_set'], 2)) : ''; ?></td>
+                <td style="font-family:monospace; font-size:11px; white-space:pre-wrap;"><?php
+                    $extra = array_diff_key($row, array_flip($knownKeys));
+                    echo $extra ? esc_html(wp_json_encode($extra)) : '';
+                ?></td>
               </tr>
             <?php endforeach; ?>
           </tbody>
