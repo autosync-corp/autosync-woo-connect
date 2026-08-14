@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.2.0
+ * Version: 0.2.1
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -197,55 +197,56 @@ function aswb_render_settings_page() {
           </tr>
         </table>
 
-        <h2>Fees &amp; Shipping <span style="font-weight:normal; font-size:13px; color:#666;">(fallback values - only used if Core Site URL above is blank, or the live fetch fails)</span></h2>
-        <p>Should match <code>autosyncadmin</code>'s "Fees &amp; Shipping" card - both drive the same business rules, just for WooCommerce vs. Medusa orders respectively. If a Core Site URL is set above, these are a safety net only.</p>
+        <h2>Fees &amp; Shipping <span style="font-weight:normal; font-size:13px; color:#666;">(read-only - source of truth is <code>autosyncadmin</code>)</span></h2>
+        <p>Shown here for visibility only. Edit these in <code>autosyncadmin</code>'s "Fees &amp; Shipping" card - this plugin only ever reads them (live from Core Site URL above, falling back to the last-saved copy below if that's blank or unreachable). Disabled fields aren't submitted, so clicking "Save Changes" never touches these.</p>
         <?php $fees = aswb_fee_settings(); $waiverModes = ['never' => 'Always charge', 'joint' => 'Waive for a full package', 'independent' => 'Waive per category independently', 'always' => 'Always free']; ?>
-        <table class="form-table">
+        <table class="form-table aswb-readonly-fees">
           <tr>
             <th>Mount &amp; Balance</th>
             <td>
-              <label><input type="checkbox" name="aswb_fee_settings[mountBalanceEnabled]" <?php checked($fees['mountBalanceEnabled']); ?>> Enabled</label>
-              &nbsp; $<input type="text" name="aswb_fee_settings[mountBalanceAmount]" value="<?php echo esc_attr($fees['mountBalanceAmount']); ?>" size="4"> per item
-              &nbsp; <select name="aswb_fee_settings[mountBalanceWaiver]"><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['mountBalanceWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
+              <label><input type="checkbox" disabled <?php checked($fees['mountBalanceEnabled']); ?>> Enabled</label>
+              &nbsp; $<input type="text" disabled value="<?php echo esc_attr($fees['mountBalanceAmount']); ?>" size="4"> per item
+              &nbsp; <select disabled><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['mountBalanceWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
             </td>
           </tr>
           <tr>
             <th>Tire Disposal</th>
             <td>
-              <label><input type="checkbox" name="aswb_fee_settings[disposalEnabled]" <?php checked($fees['disposalEnabled']); ?>> Enabled</label>
-              &nbsp; $<input type="text" name="aswb_fee_settings[disposalAmount]" value="<?php echo esc_attr($fees['disposalAmount']); ?>" size="4"> per tire
-              &nbsp; <select name="aswb_fee_settings[disposalWaiver]"><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['disposalWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
+              <label><input type="checkbox" disabled <?php checked($fees['disposalEnabled']); ?>> Enabled</label>
+              &nbsp; $<input type="text" disabled value="<?php echo esc_attr($fees['disposalAmount']); ?>" size="4"> per tire
+              &nbsp; <select disabled><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['disposalWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
             </td>
           </tr>
           <tr>
             <th>Shipping</th>
             <td>
-              <label><input type="checkbox" name="aswb_fee_settings[shippingEnabled]" <?php checked($fees['shippingEnabled']); ?>> Enabled</label>
-              &nbsp; $<input type="text" name="aswb_fee_settings[shippingAmount]" value="<?php echo esc_attr($fees['shippingAmount']); ?>" size="4"> per item
-              &nbsp; <select name="aswb_fee_settings[shippingWaiver]"><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['shippingWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
+              <label><input type="checkbox" disabled <?php checked($fees['shippingEnabled']); ?>> Enabled</label>
+              &nbsp; $<input type="text" disabled value="<?php echo esc_attr($fees['shippingAmount']); ?>" size="4"> per item
+              &nbsp; <select disabled><?php foreach ($waiverModes as $k => $l): ?><option value="<?php echo esc_attr($k); ?>" <?php selected($fees['shippingWaiver'], $k); ?>><?php echo esc_html($l); ?></option><?php endforeach; ?></select>
             </td>
           </tr>
           <tr>
             <th><label for="aswb_free_set_size">Free Set Size</label></th>
-            <td><input type="text" id="aswb_free_set_size" name="aswb_fee_settings[freeSetSize]" value="<?php echo esc_attr($fees['freeSetSize']); ?>" size="4"></td>
+            <td><input type="text" id="aswb_free_set_size" disabled value="<?php echo esc_attr($fees['freeSetSize']); ?>" size="4"></td>
           </tr>
           <tr>
             <th>Sales Tax</th>
             <td>
-              <label><input type="checkbox" name="aswb_fee_settings[salesTaxEnabled]" <?php checked($fees['salesTaxEnabled']); ?>> Enabled</label>
-              &nbsp; Default rate: <input type="text" name="aswb_fee_settings[salesTaxDefaultRate]" value="<?php echo esc_attr($fees['salesTaxDefaultRate']); ?>" size="4">%
+              <label><input type="checkbox" disabled <?php checked($fees['salesTaxEnabled']); ?>> Enabled</label>
+              &nbsp; Default rate: <input type="text" disabled value="<?php echo esc_attr($fees['salesTaxDefaultRate']); ?>" size="4">%
             </td>
           </tr>
           <tr>
             <th><label for="aswb_state_overrides">State Overrides</label></th>
             <td>
-              <textarea id="aswb_state_overrides" name="aswb_fee_settings[salesTaxStateOverridesText]" rows="4" class="regular-text" placeholder="CA:7.25&#10;NY:8"><?php
+              <textarea id="aswb_state_overrides" disabled rows="4" class="regular-text" placeholder="CA:7.25&#10;NY:8"><?php
                 foreach ($fees['salesTaxStateOverrides'] as $st => $rate) echo esc_textarea("$st:$rate") . "\n";
               ?></textarea>
               <p class="description">One per line, <code>STATE:RATE</code> - e.g. <code>CA:7.25</code>. Only add a line for states that differ from the default rate above.</p>
             </td>
           </tr>
         </table>
+        <style>.aswb-readonly-fees input:disabled, .aswb-readonly-fees select:disabled, .aswb-readonly-fees textarea:disabled { background: #f0f0f1; color: #555; opacity: 1; }</style>
         <?php submit_button(); ?>
       </form>
 
@@ -266,9 +267,46 @@ function aswb_render_settings_page() {
           <?php foreach ($log as $line): ?><li><?php echo esc_html($line); ?></li><?php endforeach; ?>
         </ul>
       <?php endif; ?>
+
+      <hr>
+      <h2>Price Verification Debug Log <span style="font-weight:normal; font-size:13px; color:#666;">(temporary - tracking down a real mispricing incident)</span></h2>
+      <p>Every cart/checkout price calculation logs one row per AutoSync line item here (newest first, capped at 60). If a line item is ever missing its AutoSync metadata, it shows up as <code>no_autosync_metadata</code> instead of <code>priced</code> - that's the case that can silently charge the generic product's raw placeholder price.</p>
+      <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:10px;">
+        <input type="hidden" name="action" value="aswb_clear_price_debug_log">
+        <?php wp_nonce_field('aswb_clear_price_debug_log'); ?>
+        <?php submit_button('Clear Log', 'secondary', 'submit', false); ?>
+      </form>
+      <?php $priceLog = get_option('aswb_price_debug_log', []); if ($priceLog): ?>
+        <table class="widefat striped" style="max-width:900px;">
+          <thead><tr><th>Time</th><th>Run</th><th>Event</th><th>Product ID</th><th>Type</th><th>Brand</th><th>SKU</th><th>Price set</th></tr></thead>
+          <tbody>
+            <?php foreach ($priceLog as $row): ?>
+              <tr>
+                <td><?php echo esc_html($row['time'] ?? ''); ?></td>
+                <td><?php echo esc_html($row['run'] ?? ''); ?></td>
+                <td><?php echo esc_html($row['event'] ?? ''); ?></td>
+                <td><?php echo esc_html($row['product_id'] ?? ''); ?></td>
+                <td><?php echo esc_html($row['type'] ?? ''); ?></td>
+                <td><?php echo esc_html($row['brand'] ?? ''); ?></td>
+                <td><?php echo esc_html($row['sku'] ?? ''); ?></td>
+                <td><?php echo isset($row['price_set']) ? esc_html('$' . number_format((float) $row['price_set'], 2)) : ''; ?></td>
+              </tr>
+            <?php endforeach; ?>
+          </tbody>
+        </table>
+      <?php else: ?>
+        <p><em>No entries yet - the log fills in as carts get calculated.</em></p>
+      <?php endif; ?>
     </div>
     <?php
 }
+
+add_action('admin_post_aswb_clear_price_debug_log', function () {
+    check_admin_referer('aswb_clear_price_debug_log');
+    delete_option('aswb_price_debug_log');
+    wp_safe_redirect(add_query_arg('aswb_cleared', '1', admin_url('options-general.php?page=aswb-settings')));
+    exit;
+});
 
 // The generic hidden WooCommerce products created for this deployment. Only
 // Wheel/Tire are used as real cart items - Disposal/Mount & Balance/Sales Tax
@@ -498,19 +536,51 @@ add_action('woocommerce_before_calculate_totals', 'aswb_verify_cart_prices', 20,
 function aswb_verify_cart_prices($cart) {
     if (is_admin() && !defined('DOING_AJAX')) return;
     static $priceCache = [];
-    foreach ($cart->get_cart() as $cart_item) {
+    static $runNumber = 0;
+    $runNumber++;
+    foreach ($cart->get_cart() as $cart_item_key => $cart_item) {
         $as = $cart_item['autosync'] ?? null;
-        if (!$as) continue;
+        if (!$as) {
+            // TEMPORARY (2026-08-14): tracking down a real incident where one line
+            // item in a mixed tire+wheel cart got charged the generic product's raw
+            // placeholder price instead of the verified AutoSync price - this branch
+            // is the only way that can happen (metadata missing entirely at
+            // calculate-totals time). Remove this log once the cause is confirmed.
+            aswb_debug_log('no_autosync_metadata', [
+                'run' => $runNumber,
+                'cart_item_key' => $cart_item_key,
+                'product_id' => $cart_item['product_id'] ?? null,
+                'quantity' => $cart_item['quantity'] ?? null,
+            ]);
+            continue;
+        }
         $cacheKey = $as['type'] . '|' . $as['brand'] . '|' . $as['sku'];
         if (!array_key_exists($cacheKey, $priceCache)) {
             $priceCache[$cacheKey] = aswb_lookup_real_price($as['type'], $as['brand'], $as['sku']);
         }
         $price = $priceCache[$cacheKey];
+        aswb_debug_log($price !== null ? 'priced' : 'lookup_failed', [
+            'run' => $runNumber,
+            'cart_item_key' => $cart_item_key,
+            'product_id' => $cart_item['product_id'] ?? null,
+            'type' => $as['type'], 'brand' => $as['brand'], 'sku' => $as['sku'],
+            'price_set' => $price !== null ? $price : 0,
+        ]);
         // Fail closed: an unverifiable item (API down, SKU no longer real) prices
         // at $0 rather than trusting anything the browser suggested - never charge
         // for an item this plugin couldn't independently confirm.
         $cart_item['data']->set_price($price !== null ? $price : 0);
     }
+}
+
+// TEMPORARY (2026-08-14): rolling debug log for the price-verification incident
+// above, capped and readable from the settings page without server access - see
+// aswb_verify_cart_prices() above and the "Price Verification Debug Log" section
+// on the settings page. Remove this whole function + call sites once resolved.
+function aswb_debug_log($event, $data) {
+    $log = get_option('aswb_price_debug_log', []);
+    array_unshift($log, array_merge(['event' => $event, 'time' => current_time('mysql')], $data));
+    update_option('aswb_price_debug_log', array_slice($log, 0, 60), false);
 }
 
 function aswb_lookup_real_price($type, $brand, $sku) {
