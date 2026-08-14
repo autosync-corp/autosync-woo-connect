@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.3.0
+ * Version: 0.3.1
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -617,14 +617,29 @@ function aswb_prepare_deposit_child($context, &$result) {
 add_action('woocommerce_rest_checkout_process_payment_with_context', 'aswb_fix_deposit_redirect', 20, 2);
 function aswb_fix_deposit_redirect($context, &$result) {
     $child = $context->order;
+    // TEMPORARY (2026-08-15): diagnosing why the redirect isn't being
+    // overridden - remove once confirmed working.
+    aswb_debug_log('redirect_hook_fired', [
+        'child_id' => ($child instanceof WC_Order) ? $child->get_id() : null,
+        'child_is_deposit' => ($child instanceof WC_Order) ? $child->get_meta('_autosync_deposit_payment') : null,
+        'result_class' => is_object($result) ? get_class($result) : gettype($result),
+        'result_has_setter' => is_object($result) && method_exists($result, 'set_redirect_url'),
+        'redirect_before' => (is_object($result) && isset($result->redirect_url)) ? $result->redirect_url : null,
+    ]);
     if (!($child instanceof WC_Order) || $child->get_meta('_autosync_deposit_payment') !== 'yes') return;
     $parentId = (int) $child->get_meta('_autosync_parent_order_id');
     $parent = $parentId ? wc_get_order($parentId) : false;
     if (!$parent) return;
     $frontendUrl = rtrim(aswb_get_allowed_origin(), '/');
+    $newUrl = $frontendUrl . '/checkout/?confirmed=1&order=' . $parent->get_id() . '&key=' . $parent->get_order_key();
     if ($frontendUrl && method_exists($result, 'set_redirect_url')) {
-        $result->set_redirect_url($frontendUrl . '/checkout/?confirmed=1&order=' . $parent->get_id() . '&key=' . $parent->get_order_key());
+        $result->set_redirect_url($newUrl);
     }
+    aswb_debug_log('redirect_hook_result', [
+        'frontend_url' => $frontendUrl,
+        'new_url' => $newUrl,
+        'redirect_after' => (is_object($result) && isset($result->redirect_url)) ? $result->redirect_url : null,
+    ]);
 }
 
 // ── Authoritative parent sync - independent of the checkout request itself,
