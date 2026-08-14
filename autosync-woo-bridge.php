@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.3.2
+ * Version: 0.3.3
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -619,7 +619,14 @@ function aswb_prepare_deposit_child($context, &$result) {
 // WooCommerce install, so the customer must never be sent to WooCommerce's
 // own order-received page - only to our own headless confirmation route,
 // using the PARENT order's id/key.
-add_action('woocommerce_rest_checkout_process_payment_with_context', 'aswb_fix_deposit_redirect', 20, 2);
+// Priority 1000, not 20: stripe_cc is a classic WC_Payment_Gateway, so
+// WooCommerce core itself runs it through its own "Legacy" compatibility
+// bridge (Automattic\WooCommerce\StoreApi\Legacy::process_legacy_payment),
+// registered on this SAME action at priority 999 - confirmed directly
+// against WooCommerce core source. That bridge unconditionally overwrites
+// redirect_url from the gateway's own return value AFTER running, which
+// silently clobbered this fix when it ran at priority 20. Must run later.
+add_action('woocommerce_rest_checkout_process_payment_with_context', 'aswb_fix_deposit_redirect', 1000, 2);
 function aswb_fix_deposit_redirect($context, &$result) {
     $child = $context->order;
     // TEMPORARY (2026-08-15): diagnosing why the redirect isn't being
