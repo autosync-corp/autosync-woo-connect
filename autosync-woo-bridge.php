@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.2.1
+ * Version: 0.2.2
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -418,6 +418,14 @@ add_action('woocommerce_blocks_loaded', function () {
             if (array_key_exists('state', $data)) {
                 WC()->session->set('autosync_state', strtoupper(sanitize_text_field((string) $data['state'])));
             }
+            // Deposit percentage for THIS checkout (100 = full payment) - the
+            // frontend is the source of truth for what it already promised the
+            // customer (e.g. "$604 today"), so it's carried through rather than
+            // re-derived server-side from a second hardcoded copy of the same rule.
+            if (isset($data['depositPct']) && is_numeric($data['depositPct'])) {
+                $pct = (float) $data['depositPct'];
+                WC()->session->set('autosync_deposit_pct', max(1, min(100, $pct)));
+            }
         },
     ]);
 });
@@ -483,6 +491,61 @@ function aswb_apply_fees($cart) {
         if ($tax > 0) $cart->add_fee('Sales Tax', $tax, false);
     }
 }
+
+// ── Deposit checkout: charge only depositPct% of the order via Stripe ───────
+// "Install at Your Tire Shop" promises "25% today, rest at install" - the
+// WooCommerce order itself still totals the full amount (correct for
+// inventory/accounting), but the real Stripe charge needs to match what the
+// checkout page actually told the customer, not the full order total.
+// The frontend's real depositPct rides along the same autosync-fees cart
+// extension as mode/state (see the update-callback above) - carried into
+// order meta here, at order-creation time, since the cart session is gone
+// by the time the payment gateway builds its Stripe PaymentIntent args.
+add_action('woocommerce_checkout_create_order', function ($order, $data) {
+    $pct = WC()->session ? (float) WC()->session->get('autosync_deposit_pct', 100) : 100;
+    if ($pct > 0 && $pct < 100) {
+        $order->update_meta_data('_autosync_deposit_pct', $pct);
+    }
+}, 10, 2);
+
+// wc_stripe_payment_intent_args is the woo-stripe-payment plugin's own real
+// filter (confirmed directly against its source, not assumed) - it wraps the
+// exact args sent to Stripe's PaymentIntent create/confirm call, defaulting
+// amount to $order->get_total(). Overriding it here is the only way to charge
+// less than the full order total without forking that plugin.
+add_filter('wc_stripe_payment_intent_args', function ($args, $order) {
+    $pct = (float) $order->get_meta('_autosync_deposit_pct');
+    if ($pct <= 0 || $pct >= 100 || !function_exists('wc_stripe_add_number_precision')) return $args;
+    $deposit = round((float) $order->get_total() * ($pct / 100), 2);
+    $args['amount'] = wc_stripe_add_number_precision($deposit, $order->get_currency());
+    $order->update_meta_data('_autosync_deposit_amount', $deposit);
+    $order->update_meta_data('_autosync_balance_due', round((float) $order->get_total() - $deposit, 2));
+    $order->save();
+    return $args;
+}, 10, 3);
+
+// A deposit order that just had its (partial) charge succeed would otherwise
+// get WooCommerce's normal "processing"/"completed" status via
+// $order->payment_complete() - misleading for staff, since it looks fully
+// paid when only the deposit came in. Force "on-hold" instead, and leave a
+// clear note with the real numbers so staff see it directly on the order.
+add_filter('woocommerce_payment_complete_order_status', function ($status, $order_id, $order) {
+    $pct = $order ? (float) $order->get_meta('_autosync_deposit_pct') : 0;
+    return ($pct > 0 && $pct < 100) ? 'on-hold' : $status;
+}, 10, 3);
+
+add_action('woocommerce_payment_complete', function ($order_id) {
+    $order = wc_get_order($order_id);
+    if (!$order) return;
+    $pct = (float) $order->get_meta('_autosync_deposit_pct');
+    if ($pct <= 0 || $pct >= 100) return;
+    $deposit = (float) $order->get_meta('_autosync_deposit_amount');
+    $balance = (float) $order->get_meta('_autosync_balance_due');
+    $order->add_order_note(sprintf(
+        'Deposit checkout: $%s (%s%%) charged via Stripe today. $%s balance due at install - collect separately, this plugin does not charge it automatically.',
+        number_format($deposit, 2), rtrim(rtrim(number_format($pct, 1), '0'), '.'), number_format($balance, 2)
+    ));
+}, 20);
 
 function aswb_maybe_send_cors_headers($route) {
     if (strpos($route, '/wc/store/') === false) return;
