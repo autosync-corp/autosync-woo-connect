@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.3.3
+ * Version: 0.4.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -629,29 +629,14 @@ function aswb_prepare_deposit_child($context, &$result) {
 add_action('woocommerce_rest_checkout_process_payment_with_context', 'aswb_fix_deposit_redirect', 1000, 2);
 function aswb_fix_deposit_redirect($context, &$result) {
     $child = $context->order;
-    // TEMPORARY (2026-08-15): diagnosing why the redirect isn't being
-    // overridden - remove once confirmed working.
-    aswb_debug_log('redirect_hook_fired', [
-        'child_id' => ($child instanceof WC_Order) ? $child->get_id() : null,
-        'child_is_deposit' => ($child instanceof WC_Order) ? $child->get_meta('_autosync_deposit_payment') : null,
-        'result_class' => is_object($result) ? get_class($result) : gettype($result),
-        'result_has_setter' => is_object($result) && method_exists($result, 'set_redirect_url'),
-        'redirect_before' => (is_object($result) && isset($result->redirect_url)) ? $result->redirect_url : null,
-    ]);
     if (!($child instanceof WC_Order) || $child->get_meta('_autosync_deposit_payment') !== 'yes') return;
     $parentId = (int) $child->get_meta('_autosync_parent_order_id');
     $parent = $parentId ? wc_get_order($parentId) : false;
     if (!$parent) return;
     $frontendUrl = rtrim(aswb_get_allowed_origin(), '/');
-    $newUrl = $frontendUrl . '/checkout/?confirmed=1&order=' . $parent->get_id() . '&key=' . $parent->get_order_key();
     if ($frontendUrl && method_exists($result, 'set_redirect_url')) {
-        $result->set_redirect_url($newUrl);
+        $result->set_redirect_url($frontendUrl . '/checkout/?confirmed=1&order=' . $parent->get_id() . '&key=' . $parent->get_order_key());
     }
-    aswb_debug_log('redirect_hook_result', [
-        'frontend_url' => $frontendUrl,
-        'new_url' => $newUrl,
-        'redirect_after' => (is_object($result) && isset($result->redirect_url)) ? $result->redirect_url : null,
-    ]);
 }
 
 // ── Authoritative parent sync - independent of the checkout request itself,
@@ -723,6 +708,51 @@ foreach (['new_order', 'customer_processing_order', 'customer_completed_order', 
         return $enabled;
     }, 10, 2);
 }
+
+// ── Also exclude deposit child orders from the DEFAULT wp-admin Orders list -
+// staff work with one real order (the parent); the child stays a real,
+// fully accessible WooCommerce order (Stripe transaction/refund record,
+// direct URL, linked from the parent's own screen below) without cluttering
+// the main list as if it were a second customer purchase. meta_query works
+// against both classic (postmeta) and HPOS order storage - confirmed
+// directly against WooCommerce core's OrdersTableQuery, which supports the
+// same meta_query shape as classic WP_Query.
+add_filter('woocommerce_order_list_table_prepare_items_query_args', function ($args) {
+    $args['meta_query'] = $args['meta_query'] ?? [];
+    $args['meta_query'][] = ['key' => '_autosync_deposit_payment', 'compare' => 'NOT EXISTS'];
+    return $args;
+});
+
+// ── Payment summary + link on the PARENT order's own edit screen, so staff
+// have one place to see full total / deposit / balance and reach the
+// (otherwise hidden-from-the-list) deposit child for refunds or Stripe
+// transaction detail.
+add_action('woocommerce_admin_order_data_after_order_details', function ($order) {
+    $childId = (int) $order->get_meta('_autosync_deposit_order_id');
+    if (!$childId) return; // not a deposit order
+    $child = wc_get_order($childId);
+    $fullTotal = (float) $order->get_meta('_autosync_full_total');
+    $depositAmount = (float) $order->get_meta('_autosync_deposit_amount');
+    $balance = (float) $order->get_meta('_autosync_balance_due');
+    ?>
+    <div class="order_data_column" style="clear:both; width:100%; margin-top:10px; padding-top:10px; border-top:1px solid #eee;">
+        <h3>Deposit Payment Summary</h3>
+        <p>
+            Full Order Total: <strong><?php echo wp_kses_post(wc_price($fullTotal)); ?></strong><br>
+            Deposit Required (<?php echo esc_html(ASWB_DEPOSIT_PCT); ?>%): <?php echo wp_kses_post(wc_price($depositAmount)); ?><br>
+            Deposit Paid: <?php echo wp_kses_post(wc_price($depositAmount)); ?><br>
+            Remaining Balance: <strong><?php echo wp_kses_post(wc_price($balance)); ?></strong> - collect separately, not charged automatically.
+        </p>
+        <?php if ($child): ?>
+            <p>
+                Deposit payment: <a href="<?php echo esc_url($child->get_edit_order_url()); ?>">Order #<?php echo esc_html($child->get_order_number()); ?></a>
+                (<?php echo esc_html(wc_get_order_status_name($child->get_status())); ?>, <?php echo wp_kses_post(wc_price((float) $child->get_total())); ?>)
+                - refunds for the actual Stripe charge happen there.
+            </p>
+        <?php endif; ?>
+    </div>
+    <?php
+});
 
 function aswb_maybe_send_cors_headers($route) {
     if (strpos($route, '/wc/store/') === false) return;
