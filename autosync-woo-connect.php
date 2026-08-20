@@ -7,15 +7,38 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.5.0
+ * Version: 0.6.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
- * then Activate (or re-upload over an existing install - WordPress offers to
- * replace it). Check the Version number above/in the Plugins list after
- * uploading to confirm the new copy actually took - bump it on every edit.
+ * then Activate. After the first install, updates are automatic (see below) -
+ * WordPress will show a normal "Update available" notice on the Plugins page,
+ * no manual re-download/re-upload needed. Check the Version number above/in
+ * the Plugins list to confirm an update actually took - bump it on every edit.
  */
 
 if (!defined('ABSPATH')) exit; // no direct access
+
+// ── Self-update via the plugin's own GitHub repo ────────────────────────────
+// This plugin is developed inside the autosynccore monorepo, but distributed
+// from its own dedicated public repo (autosync-corp/autosync-woo-connect) -
+// autosynccore is private, and a client-managed WordPress site can't check a
+// private repo for updates without an embedded access token, which isn't
+// worth the risk for a plugin that has no secrets in it to begin with (API
+// keys/fee config live in fee-config.php/client.js, never here).
+//
+// Tracks the 'main' branch's Version header directly (not GitHub Releases/
+// tags) - bump the version above, publish to that branch, done. Using any
+// branch name other than 'master' skips PUC's tag/release-first fallback
+// logic entirely, so this is intentionally never named 'master'.
+require_once __DIR__ . '/plugin-update-checker/plugin-update-checker.php';
+use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
+
+$aswbUpdateChecker = PucFactory::buildUpdateChecker(
+    'https://github.com/autosync-corp/autosync-woo-connect/',
+    __FILE__,
+    'autosync-woo-connect'
+);
+$aswbUpdateChecker->setBranch('main');
 
 // ── Auto-provision a placeholder shipping method, on every zone missing one ─
 // Checkout requires a real shipping rate whenever an order needs shipping -
