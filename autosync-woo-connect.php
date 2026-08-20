@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.6.0
+ * Version: 0.7.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -162,6 +162,21 @@ add_action('admin_init', function () {
         },
     ]);
     register_setting('aswb_settings', 'aswb_fee_settings', ['sanitize_callback' => 'aswb_sanitize_fee_settings']);
+    register_setting('aswb_settings', 'aswb_disable_gutenberg', ['sanitize_callback' => function ($v) { return $v ? '1' : '0'; }]);
+});
+
+// Off by default - only disables the block editor (posts/pages, and the
+// widgets screen) if a client explicitly opts in on the settings page below.
+// Doesn't need the separate Classic Editor plugin - these are the same two
+// core WordPress filters that plugin itself uses under the hood. Safe with
+// this site's headless setup specifically: the REST API always returns
+// content.rendered (fully-resolved HTML), regardless of which editor wrote
+// it, so the frontend this content actually displays on is never affected -
+// this only changes the wp-admin writing experience.
+add_action('init', function () {
+    if (!get_option('aswb_disable_gutenberg')) return;
+    add_filter('use_block_editor_for_post_type', '__return_false');
+    add_filter('use_widgets_block_editor', '__return_false');
 });
 
 // Every site's fee amounts/rules differ - same reasoning as the API key/
@@ -218,6 +233,14 @@ function aswb_render_settings_page() {
             <td>
               <input type="text" id="aswb_core_site_url" name="aswb_core_site_url" value="<?php echo esc_attr(get_option('aswb_core_site_url', '')); ?>" class="regular-text" placeholder="https://devcore.autosynccorp.com">
               <p class="description">The core site's own URL (not this WordPress site). When set, fee/shipping/tax values below are fetched live from <code>{this URL}/fee-config.php</code> and cached for 10 minutes - <code>autosyncadmin</code> becomes the real source of truth. Leave blank to always use the values below directly.</p>
+            </td>
+          </tr>
+          <tr>
+            <th>Editor</th>
+            <td>
+              <input type="hidden" name="aswb_disable_gutenberg" value="0">
+              <label><input type="checkbox" id="aswb_disable_gutenberg" name="aswb_disable_gutenberg" value="1" <?php checked(get_option('aswb_disable_gutenberg')); ?>> Disable the block editor (Gutenberg) - use the Classic Editor instead</label>
+              <p class="description">Applies to posts, pages, and the Widgets screen. No separate plugin needed. Safe with this site's headless setup either way - the content this WordPress instance actually publishes to the storefront is always fully-rendered HTML from the REST API, regardless of which editor wrote it, so this only changes the writing experience in wp-admin.</p>
             </td>
           </tr>
         </table>
