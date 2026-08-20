@@ -1,13 +1,13 @@
 <?php
 /**
- * Plugin Name: AutoSync WooCommerce Bridge
+ * Plugin Name: AutoSync Woo Connect
  * Description: Bridges AutoSync's real tire/wheel catalog into WooCommerce's
  *              headless Store API cart/checkout. The AutoSync catalog is never
  *              synced into WooCommerce - two generic hidden products (Wheel,
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.4.0
+ * Version: 0.5.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate (or re-upload over an existing install - WordPress offers to
@@ -109,8 +109,8 @@ function aswb_provision_shipping_methods() {
 }
 
 // ── Configuration ────────────────────────────────────────────────────────────
-// API key and allowed origin are editable under Settings -> AutoSync Bridge in
-// wp-admin (see the settings page below) - no code edit/re-upload needed to
+// API key and allowed origin are editable under Settings -> AutoSync Woo Connect
+// in wp-admin (see the settings page below) - no code edit/re-upload needed to
 // change deployments, just the two things every install actually differs on.
 define('ASWB_AUTOSYNC_API_BASE', 'https://api.autosyncstudio.com');
 
@@ -122,9 +122,11 @@ function aswb_get_allowed_origin() {
     return get_option('aswb_allowed_origin', 'https://devcore.autosynccorp.com');
 }
 
-// ── Settings page: Settings -> AutoSync Bridge ──────────────────────────────
+// ── Settings page: Settings -> AutoSync Woo Connect ─────────────────────────
+// Page slug ('aswb-settings') is left as-is - it's an internal identifier,
+// not user-visible, and changing it isn't a cosmetic change (see below).
 add_action('admin_menu', function () {
-    add_options_page('AutoSync Bridge', 'AutoSync Bridge', 'manage_options', 'aswb-settings', 'aswb_render_settings_page');
+    add_options_page('AutoSync Woo Connect', 'AutoSync Woo Connect', 'manage_options', 'aswb-settings', 'aswb_render_settings_page');
 });
 
 add_action('admin_init', function () {
@@ -175,7 +177,7 @@ function aswb_render_settings_page() {
     if (!current_user_can('manage_options')) return;
     ?>
     <div class="wrap">
-      <h1>AutoSync Bridge</h1>
+      <h1>AutoSync Woo Connect</h1>
       <p>Must match this deployment's frontend exactly - <code>window.AUTOSYNC_CONFIG.apiKey</code> for the API key, and the real customer-facing origin for the allowed origin (e.g. <code>http://localhost:8080</code> while testing locally, the real production domain once deployed).</p>
       <form method="post" action="options.php">
         <?php settings_fields('aswb_settings'); ?>
@@ -326,7 +328,7 @@ define('ASWB_PRODUCT_TIRE', 14308);
 // this fetches the live values from fee-config.php on every call (cached
 // briefly so a cart calculation never waits on a slow/down request), and only
 // falls back to the locally-saved copy (editable under Settings -> AutoSync
-// Bridge, below) if the core site is unreachable. The local copy is a safety
+// Woo Connect, below) if the core site is unreachable. The local copy is a safety
 // net, not a second real source - keep it roughly in sync manually, but it
 // only ever matters when the fetch itself fails.
 function aswb_fee_settings() {
