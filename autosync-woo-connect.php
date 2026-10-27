@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.7.0
+ * Version: 0.8.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -137,6 +137,13 @@ function aswb_provision_shipping_methods() {
 // change deployments, just the two things every install actually differs on.
 define('ASWB_AUTOSYNC_API_BASE', 'https://api.autosyncstudio.com');
 
+// The last-resort deposit percentage, used only when autosyncadmin's own
+// value cannot be read. Defined up here rather than beside the deposit code
+// because aswb_fee_settings() and aswb_deposit_pct() both reference it from
+// further up the file, and relying on call-order for that is the kind of
+// thing that passes every check and then fails once at runtime.
+define('ASWB_DEPOSIT_PCT', 25);
+
 function aswb_get_api_key() {
     return get_option('aswb_autosync_api_key', 'MFCtst');
 }
@@ -249,6 +256,24 @@ function aswb_render_settings_page() {
         <p>Shown here for visibility only. Edit these in <code>autosyncadmin</code>'s "Fees &amp; Shipping" card - this plugin only ever reads them (live from Core Site URL above, falling back to the last-saved copy below if that's blank or unreachable). Disabled fields aren't submitted, so clicking "Save Changes" never touches these.</p>
         <?php $fees = aswb_fee_settings(); $waiverModes = ['never' => 'Always charge', 'joint' => 'Waive for a full package', 'independent' => 'Waive per category independently', 'always' => 'Always free']; ?>
         <table class="form-table aswb-readonly-fees">
+          <tr>
+            <th>Checkout mode</th>
+            <td>
+              <select disabled>
+                <?php foreach (['both' => 'Both - install or ship', 'ship' => 'Shipping only', 'install' => 'Install only'] as $k => $l): ?>
+                  <option value="<?php echo esc_attr($k); ?>" <?php selected(aswb_store_mode(), $k); ?>><?php echo esc_html($l); ?></option>
+                <?php endforeach; ?>
+              </select>
+              &nbsp; <span style="color:#666;">A mode this store does not offer is rejected, whatever the browser sends.</span>
+            </td>
+          </tr>
+          <tr>
+            <th>Deposit at checkout</th>
+            <td>
+              <input type="text" disabled value="<?php echo esc_attr(aswb_deposit_pct()); ?>" size="4">%
+              &nbsp; <span style="color:#666;">Install-mode card orders only. Ignored when Shipping only.</span>
+            </td>
+          </tr>
           <tr>
             <th>Mount &amp; Balance</th>
             <td>
@@ -385,6 +410,10 @@ function aswb_fee_settings() {
         'freeSetSize' => 4,
         'salesTaxEnabled' => true, 'salesTaxDefaultRate' => 6,
         'salesTaxStateOverrides' => [], // ['CA' => 7.25, ...] - uppercase state keys
+        // Permissive on purpose: if the core site is unreachable, or is still
+        // running a fee-config.php that predates these keys, the plugin must
+        // behave exactly as it did before rather than start refusing orders.
+        'checkoutModes' => 'both', 'depositPct' => ASWB_DEPOSIT_PCT,
     ]);
 
     $coreUrl = rtrim(get_option('aswb_core_site_url', ''), '/');
@@ -403,6 +432,39 @@ function aswb_fee_settings() {
 
     set_transient('aswb_fee_settings_live', $live, 10 * MINUTE_IN_SECONDS);
     return $live;
+}
+
+// ── The store's own rules, which the client does not get a vote on ─────────
+// The mode decides whether an order pays a deposit and whether shipping is
+// charged, so it is worth as much money as the prices themselves - and it was
+// the one such input still taken from the browser. A ship-only store can now
+// never price an order as an install, whatever arrives over the Store API and
+// whatever a stale session is still holding.
+function aswb_store_mode() {
+    $fees = aswb_fee_settings();
+    $m = isset($fees['checkoutModes']) ? $fees['checkoutModes'] : 'both';
+    return in_array($m, ['both', 'ship', 'install'], true) ? $m : 'both';
+}
+
+// The mode this request is actually allowed to use. Call this everywhere the
+// mode is read - clamping only where the session is SET would still let a
+// value stored before a mode change survive in an open cart.
+function aswb_effective_mode() {
+    $store = aswb_store_mode();
+    if ($store === 'ship' || $store === 'install') return $store;
+    // 'both' - the client chooses, and install stays the default it has always
+    // been for a session that never said.
+    $m = WC()->session ? WC()->session->get('autosync_mode', 'install') : 'install';
+    return $m === 'ship' ? 'ship' : 'install';
+}
+
+// autosyncadmin owns the percentage; ASWB_DEPOSIT_PCT is only the floor under
+// an unreachable core site. Without this the storefront could advertise 40%
+// and Stripe would charge 25%.
+function aswb_deposit_pct() {
+    $fees = aswb_fee_settings();
+    $p = isset($fees['depositPct']) ? (float) $fees['depositPct'] : 0;
+    return ($p > 0 && $p <= 100) ? $p : ASWB_DEPOSIT_PCT;
 }
 
 // ── CORS: let the headless frontend call the Store API cross-origin ─────────
@@ -465,6 +527,8 @@ add_action('woocommerce_blocks_loaded', function () {
     woocommerce_store_api_register_update_callback([
         'namespace' => 'autosync-fees',
         'callback' => function ($data) {
+            // Recorded, not obeyed: every read goes through aswb_effective_mode(),
+            // which clamps this to what the store actually offers.
             if (isset($data['mode']) && in_array($data['mode'], ['install', 'ship'], true)) {
                 WC()->session->set('autosync_mode', sanitize_text_field($data['mode']));
             }
@@ -488,7 +552,7 @@ add_action('woocommerce_cart_calculate_fees', 'aswb_apply_fees', 10, 1);
 function aswb_apply_fees($cart) {
     if (is_admin() && !defined('DOING_AJAX')) return;
 
-    $mode = WC()->session ? WC()->session->get('autosync_mode', 'install') : 'install';
+    $mode = aswb_effective_mode();
     $state = WC()->session ? WC()->session->get('autosync_state', '') : '';
 
     $tireQty = 0;
@@ -554,8 +618,10 @@ function aswb_apply_fees($cart) {
 // project memory for the full design discussion.
 //
 // Percentage/eligibility are decided ENTIRELY here, never trusted from the
-// frontend - a raw API call cannot influence what gets charged.
-define('ASWB_DEPOSIT_PCT', 25);
+// frontend - a raw API call cannot influence what gets charged. The
+// percentage itself now comes from autosyncadmin via aswb_deposit_pct();
+// ASWB_DEPOSIT_PCT (defined near the top, since functions above this point
+// reference it) is only the floor under an unreachable core site.
 
 // ── Expose deposit info to the frontend for DISPLAY only (never authoritative
 // for charging) - same mechanism already used for per-item autosync data,
@@ -571,13 +637,14 @@ add_action('woocommerce_blocks_loaded', function () {
             // only ever offers card/stripe_cc for this cart module - see
             // checkout/index.html's payment-method gating), so mode alone is a
             // sufficient eligibility proxy for display purposes here.
-            $mode = WC()->session ? WC()->session->get('autosync_mode', 'install') : 'install';
+            $mode = aswb_effective_mode();
             $eligible = $mode === 'install';
+            $pct = aswb_deposit_pct();
             $fullTotal = (float) WC()->cart->get_total('edit');
-            $due = $eligible ? round($fullTotal * (ASWB_DEPOSIT_PCT / 100), 2) : $fullTotal;
+            $due = $eligible ? round($fullTotal * ($pct / 100), 2) : $fullTotal;
             return [
                 'eligible' => $eligible,
-                'percentage' => $eligible ? ASWB_DEPOSIT_PCT : 100,
+                'percentage' => $eligible ? $pct : 100,
                 'full_total' => $fullTotal,
                 'due_today' => $due,
                 'balance_due' => round($fullTotal - $due, 2),
@@ -609,13 +676,13 @@ function aswb_prepare_deposit_child($context, &$result) {
     $parent = $context->order;
     if (!($parent instanceof WC_Order)) return;
 
-    $mode = WC()->session ? WC()->session->get('autosync_mode', 'install') : 'install';
+    $mode = aswb_effective_mode();
     // $context->payment_method is WooCommerce's own authoritative record of the
     // chosen gateway - never a frontend-supplied label.
     $eligible = ($mode === 'install') && ($context->payment_method === 'stripe_cc');
     if (!$eligible) return;
 
-    $depositAmount = round((float) $parent->get_total() * (ASWB_DEPOSIT_PCT / 100), 2);
+    $depositAmount = round((float) $parent->get_total() * (aswb_deposit_pct() / 100), 2);
 
     // Idempotent: a retry (double-click, network retry, a prior failed
     // attempt) reuses the existing pending/failed child instead of creating
@@ -643,7 +710,7 @@ function aswb_prepare_deposit_child($context, &$result) {
         // attached to the generic Wheel/Tire products so it can never affect
         // their stock or sales reporting.
         $fee = new WC_Order_Item_Fee();
-        $fee->set_name(ASWB_DEPOSIT_PCT . '% Deposit for Order #' . $parent->get_order_number());
+        $fee->set_name(aswb_deposit_pct() . '% Deposit for Order #' . $parent->get_order_number());
         $fee->set_amount($depositAmount);
         $fee->set_total($depositAmount);
         $fee->set_tax_status('none');
@@ -655,6 +722,9 @@ function aswb_prepare_deposit_child($context, &$result) {
         $parent->update_meta_data('_autosync_deposit_order_id', $child->get_id());
         $parent->update_meta_data('_autosync_full_total', (float) $parent->get_total());
         $parent->update_meta_data('_autosync_deposit_amount', $depositAmount);
+        // Stored per order: the percentage can change later, and a past order's
+        // summary must keep describing what was actually charged.
+        $parent->update_meta_data('_autosync_deposit_pct', aswb_deposit_pct());
         $parent->update_meta_data('_autosync_balance_due', round((float) $parent->get_total() - $depositAmount, 2));
         $parent->save();
     }
@@ -787,7 +857,7 @@ add_action('woocommerce_admin_order_data_after_order_details', function ($order)
         <h3>Deposit Payment Summary</h3>
         <p>
             Full Order Total: <strong><?php echo wp_kses_post(wc_price($fullTotal)); ?></strong><br>
-            Deposit Required (<?php echo esc_html(ASWB_DEPOSIT_PCT); ?>%): <?php echo wp_kses_post(wc_price($depositAmount)); ?><br>
+            Deposit Required (<?php echo esc_html($order->get_meta('_autosync_deposit_pct') ?: ASWB_DEPOSIT_PCT); ?>%): <?php echo wp_kses_post(wc_price($depositAmount)); ?><br>
             Deposit Paid: <?php echo wp_kses_post(wc_price($depositAmount)); ?><br>
             Remaining Balance: <strong><?php echo wp_kses_post(wc_price($balance)); ?></strong> - collect separately, not charged automatically.
         </p>
