@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.8.0
+ * Version: 0.9.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -43,9 +43,9 @@ $aswbUpdateChecker->setBranch('main');
 // ── Auto-provision a placeholder shipping method, on every zone missing one ─
 // Checkout requires a real shipping rate whenever an order needs shipping -
 // with zero methods configured anywhere, checkout fails outright ("this order
-// requires a shipping option"). The real shipping CHARGE is already computed
-// independently as our own "Shipping" fee (see aswb_apply_fees below) - this
-// only satisfies checkout's rate-selection requirement with a Free Shipping method,
+// requires a shipping option"). The real shipping CHARGE from autosyncadmin is
+// priced onto whichever rate this provides (see aswb_price_shipping_rates
+// below), so this is both the rate checkout selects and the line it is paid on,
 // customer-facing title just "Standard Shipping" (clean - the client manages
 // real orders/shipping through this same wp-admin, so nothing engineering-
 // internal should leak into what they or their customers see). Idempotent:
@@ -108,11 +108,11 @@ function aswb_provision_shipping_methods() {
                 $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): found a disabled method (instance {$m->instance_id}) - enabled it.";
                 continue;
             }
-            // Free Shipping, not a Flat Rate priced at 0 - "free" is unambiguous and
-            // has no cost field to accidentally edit later. Editing this method's
-            // cost would double-charge, since the real amount already lives in our
-            // own "Shipping" fee (aswb_apply_fees) - a Flat Rate with a $0 field
-            // sitting right there in wp-admin invites exactly that mistake.
+            // Free Shipping rather than a Flat Rate: it has no cost field in
+            // wp-admin to edit, and aswb_price_shipping_rates overrides the cost
+            // anyway. A Flat Rate would put an editable $0 box in front of the
+            // client that looks like it sets the shipping price and does not -
+            // autosyncadmin is the only place that number comes from.
             $instanceId = $zone->add_shipping_method('free_shipping');
             if (!$instanceId) {
                 $log[] = "Zone $zoneId (\"{$zone->get_zone_name()}\"): add_shipping_method('free_shipping') returned nothing - failed.";
@@ -388,7 +388,8 @@ add_action('admin_post_aswb_clear_price_debug_log', function () {
 
 // The generic hidden WooCommerce products created for this deployment. Only
 // Wheel/Tire are used as real cart items - Disposal/Mount & Balance/Sales Tax
-// are computed as WooCommerce "fees" instead (see aswb_apply_fees below), not
+// are computed as WooCommerce "fees" instead (see aswb_apply_fees below;
+// shipping is a real shipping line, not a fee), not
 // cart items, so they don't need product IDs here even though matching hidden
 // products exist in the store (harmless, just unused by this mechanism).
 define('ASWB_PRODUCT_WHEEL', 14307);
@@ -548,13 +549,9 @@ add_action('woocommerce_blocks_loaded', function () {
 // computed charge with no product behind it (no fragile add/remove/update of
 // a fake cart item needed); this hook re-runs on every totals calculation, so
 // there's nothing to keep in sync as the cart's real tire/wheel qty changes.
-add_action('woocommerce_cart_calculate_fees', 'aswb_apply_fees', 10, 1);
-function aswb_apply_fees($cart) {
-    if (is_admin() && !defined('DOING_AJAX')) return;
-
-    $mode = aswb_effective_mode();
-    $state = WC()->session ? WC()->session->get('autosync_state', '') : '';
-
+// How many tires and wheels are in this cart. Items without our own metadata
+// are not ours to charge fees on and are skipped.
+function aswb_cart_quantities($cart) {
     $tireQty = 0;
     $wheelQty = 0;
     foreach ($cart->get_cart() as $item) {
@@ -563,38 +560,94 @@ function aswb_apply_fees($cart) {
         if ($as['type'] === 'tire') $tireQty += $item['quantity'];
         if ($as['type'] === 'wheel') $wheelQty += $item['quantity'];
     }
+    return [$tireQty, $wheelQty];
+}
+
+// Mirrors checkout/index.php's computeQtyFee() exactly - see that file's
+// comment for what each waiverMode/applyTo combination means.
+function aswb_qty_fee($enabled, $amount, $waiverMode, $applyTo, $applies, $tireQty, $wheelQty, $freeSetSize) {
+    if (!$enabled || !$applies || $waiverMode === 'always') return 0;
+    $isPackage = $tireQty >= $freeSetSize && $wheelQty >= $freeSetSize;
+    if ($waiverMode === 'independent') {
+        if ($applyTo === 'both') {
+            return ($tireQty >= $freeSetSize ? 0 : $tireQty * $amount) + ($wheelQty >= $freeSetSize ? 0 : $wheelQty * $amount);
+        }
+        $qty = $applyTo === 'tire' ? $tireQty : $wheelQty;
+        return $qty >= $freeSetSize ? 0 : $qty * $amount;
+    }
+    $qty = $applyTo === 'tire' ? $tireQty : ($applyTo === 'wheel' ? $wheelQty : ($tireQty + $wheelQty));
+    if ($waiverMode === 'joint') return $isPackage ? 0 : $qty * $amount;
+    return $qty * $amount; // 'never'
+}
+
+// What shipping costs this cart - $0 unless the order is actually being
+// shipped. Called from the shipping-rate filter, which runs BEFORE fees, so
+// this has to be computable on its own rather than read back from them.
+function aswb_shipping_amount($cart) {
+    $fees = aswb_fee_settings();
+    list($tireQty, $wheelQty) = aswb_cart_quantities($cart);
+    return aswb_qty_fee(
+        $fees['shippingEnabled'], (float) $fees['shippingAmount'], $fees['shippingWaiver'],
+        'both', aswb_effective_mode() === 'ship',
+        $tireQty, $wheelQty, (float) $fees['freeSetSize']
+    );
+}
+
+// ── Shipping is a shipping line, not a fee ─────────────────────────────────
+// Priced onto the rate the order actually uses. As a fee it summed into the
+// right total but printed as "Fees $73.49 / Shipping $0.00" in wp-admin and in
+// the customer's email, with the $0 coming from the placeholder method above.
+add_filter('woocommerce_package_rates', 'aswb_price_shipping_rates', 100, 2);
+function aswb_price_shipping_rates($rates, $package) {
+    if (!WC()->cart) return $rates;
+    $amount = aswb_shipping_amount(WC()->cart);
+    foreach ($rates as $rate) {
+        $rate->set_cost($amount);
+        // Our own flat Sales Tax fee is the only tax on these orders - every
+        // fee is added non-taxable for the same reason - so the rate must not
+        // pick up WooCommerce's tax engine either.
+        $rate->set_taxes([]);
+        if ($amount > 0) $rate->set_label('Shipping');
+    }
+    return $rates;
+}
+
+// WooCommerce caches calculated rates against a hash of the package, and the
+// package has no idea the checkout mode exists - so a cart that switched
+// install <-> ship would keep being served the previous mode's price. Putting
+// the mode into the package puts it into the hash.
+add_filter('woocommerce_cart_shipping_packages', 'aswb_mode_in_shipping_package', 10, 1);
+function aswb_mode_in_shipping_package($packages) {
+    $mode = aswb_effective_mode();
+    foreach ($packages as $i => $package) {
+        $packages[$i]['autosync_mode'] = $mode;
+    }
+    return $packages;
+}
+
+add_action('woocommerce_cart_calculate_fees', 'aswb_apply_fees', 10, 1);
+function aswb_apply_fees($cart) {
+    if (is_admin() && !defined('DOING_AJAX')) return;
+
+    $mode = aswb_effective_mode();
+    $state = WC()->session ? WC()->session->get('autosync_state', '') : '';
+
+    list($tireQty, $wheelQty) = aswb_cart_quantities($cart);
 
     $fees = aswb_fee_settings();
     $freeSetSize = (float) $fees['freeSetSize'];
-    $isPackage = $tireQty >= $freeSetSize && $wheelQty >= $freeSetSize;
-
-    // Mirrors checkout/index.html's computeQtyFee() exactly - see that file's
-    // comment for what each waiverMode/applyTo combination means.
-    $qtyFee = function ($enabled, $amount, $waiverMode, $applyTo, $applies) use ($tireQty, $wheelQty, $freeSetSize, $isPackage) {
-        if (!$enabled || !$applies || $waiverMode === 'always') return 0;
-        if ($waiverMode === 'independent') {
-            if ($applyTo === 'both') {
-                return ($tireQty >= $freeSetSize ? 0 : $tireQty * $amount) + ($wheelQty >= $freeSetSize ? 0 : $wheelQty * $amount);
-            }
-            $qty = $applyTo === 'tire' ? $tireQty : $wheelQty;
-            return $qty >= $freeSetSize ? 0 : $qty * $amount;
-        }
-        $qty = $applyTo === 'tire' ? $tireQty : ($applyTo === 'wheel' ? $wheelQty : ($tireQty + $wheelQty));
-        if ($waiverMode === 'joint') return $isPackage ? 0 : $qty * $amount;
-        return $qty * $amount; // 'never'
-    };
 
     // Mount & Balance / Disposal are pickup-only services - unconditionally $0
     // for ship-mode regardless of waiverMode, same rule as the frontend.
-    $mount = $qtyFee($fees['mountBalanceEnabled'], (float) $fees['mountBalanceAmount'], $fees['mountBalanceWaiver'], 'both', $mode !== 'ship');
-    $disposal = $qtyFee($fees['disposalEnabled'], (float) $fees['disposalAmount'], $fees['disposalWaiver'], 'tire', $mode !== 'ship');
-    $shipping = $qtyFee($fees['shippingEnabled'], (float) $fees['shippingAmount'], $fees['shippingWaiver'], 'both', $mode === 'ship');
+    $mount = aswb_qty_fee($fees['mountBalanceEnabled'], (float) $fees['mountBalanceAmount'], $fees['mountBalanceWaiver'], 'both', $mode !== 'ship', $tireQty, $wheelQty, $freeSetSize);
+    $disposal = aswb_qty_fee($fees['disposalEnabled'], (float) $fees['disposalAmount'], $fees['disposalWaiver'], 'tire', $mode !== 'ship', $tireQty, $wheelQty, $freeSetSize);
+    // Shipping is deliberately absent here: it is a shipping line now, priced
+    // in aswb_price_shipping_rates. Adding it as a fee as well would charge twice.
 
     // Each fee is added non-taxable - sales tax below is our own flat-rate line,
     // not WooCommerce's tax engine, so these shouldn't also get taxed by it.
     if ($mount > 0) $cart->add_fee('Mount & Balance', $mount, false);
     if ($disposal > 0) $cart->add_fee('Tire Disposal', $disposal, false);
-    if ($shipping > 0) $cart->add_fee('Shipping', $shipping, false);
 
     if ($fees['salesTaxEnabled']) {
         $subtotal = $cart->get_subtotal();
