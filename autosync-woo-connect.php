@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.0
+ * Version: 0.10.1
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -1066,13 +1066,29 @@ function aswb_lookup_real_price($type, $brand, $sku) {
 // URL here would be a tracking pixel aimed at their inbox. Every AutoSync
 // catalog image is served from one host over https; anything else is dropped
 // rather than rendered.
-const ASWB_IMAGE_HOSTS = ['storage.googleapis.com'];
+// Confirmed against the live API, not inferred: wheel images are served from
+// wheels.autosyncstudio.com (ImgUrlBase and Img500UrlBase), while tire images
+// and brand logos come from storage.googleapis.com (autosync_tires/,
+// autosync_tires/_spins/, autosync-brand-logos/). 0.10.0 listed only the
+// second host, which silently dropped every wheel image - the catalog this
+// store actually sells.
+//
+// Exact host, https only. The base arrives in the API response rather than
+// being built here, so a deployment served a new host can add it through the
+// filter without waiting on a plugin release.
+function aswb_image_hosts() {
+    return (array) apply_filters('aswb_image_hosts', [
+        'wheels.autosyncstudio.com',
+        'storage.googleapis.com',
+    ]);
+}
 function aswb_safe_image_url($url) {
     $url = trim((string) $url);
     if ($url === '') return '';
     $parts = wp_parse_url($url);
     if (empty($parts['scheme']) || strtolower($parts['scheme']) !== 'https') return '';
-    if (empty($parts['host']) || !in_array(strtolower($parts['host']), ASWB_IMAGE_HOSTS, true)) return '';
+    $hosts = array_map('strtolower', aswb_image_hosts());
+    if (empty($parts['host']) || !in_array(strtolower($parts['host']), $hosts, true)) return '';
     return esc_url_raw($url);
 }
 
