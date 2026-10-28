@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.9.0
+ * Version: 0.10.0
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -511,6 +511,7 @@ add_action('woocommerce_blocks_loaded', function () {
                 'name' => ['type' => ['string', 'null']],
                 'size' => ['type' => ['string', 'null']],
                 'vehicle' => ['type' => ['string', 'null']],
+                'image' => ['type' => ['string', 'null']],
             ];
         },
         'schema_type' => ARRAY_A,
@@ -607,7 +608,24 @@ function aswb_price_shipping_rates($rates, $package) {
         // fee is added non-taxable for the same reason - so the rate must not
         // pick up WooCommerce's tax engine either.
         $rate->set_taxes([]);
-        if ($amount > 0) $rate->set_label('Shipping');
+        if ($amount > 0) {
+            // 0.9.0 set this to "Shipping". The order email prints the method
+            // name under its own "Shipping:" heading, so it read
+            // "Shipping: Shipping". Only the auto-provisioned Free Shipping
+            // method is renamed now - its name is actively wrong once it has
+            // a cost - while a method the store owner named themselves is
+            // left alone, because WooCommerce > Settings > Shipping is where
+            // they expect to control that text.
+            //
+            // A delivery promise ("3-5 business days") belongs in that method
+            // title, per store. It must never be baked in here, where it
+            // would ship to every other client as a claim about a service
+            // they may not offer.
+            $label = trim((string) $rate->get_label());
+            if ($label === '' || stripos($label, 'free shipping') !== false) {
+                $rate->set_label(apply_filters('aswb_shipping_label', 'Standard shipping', $rate, $package));
+            }
+        }
     }
     return $rates;
 }
@@ -965,6 +983,8 @@ add_filter('woocommerce_store_api_add_to_cart_data', function ($add_to_cart_data
         'name' => sanitize_text_field($data['name'] ?? ''),
         'size' => sanitize_text_field($data['size'] ?? ''),
         'vehicle' => sanitize_text_field($data['vehicle'] ?? ''),
+        // Cosmetic only, and host-restricted - see aswb_safe_image_url.
+        'image' => aswb_safe_image_url($data['image'] ?? ''),
     ];
     return $add_to_cart_data;
 }, 10, 2);
@@ -1041,6 +1061,43 @@ function aswb_lookup_real_price($type, $brand, $sku) {
     return (float) $items[0]['Price'];
 }
 
+// Catalog image URLs travel from the browser with the cart item. An order
+// email is read by the store owner as well as the customer, so an arbitrary
+// URL here would be a tracking pixel aimed at their inbox. Every AutoSync
+// catalog image is served from one host over https; anything else is dropped
+// rather than rendered.
+const ASWB_IMAGE_HOSTS = ['storage.googleapis.com'];
+function aswb_safe_image_url($url) {
+    $url = trim((string) $url);
+    if ($url === '') return '';
+    $parts = wp_parse_url($url);
+    if (empty($parts['scheme']) || strtolower($parts['scheme']) !== 'https') return '';
+    if (empty($parts['host']) || !in_array(strtolower($parts['host']), ASWB_IMAGE_HOSTS, true)) return '';
+    return esc_url_raw($url);
+}
+
+// Every order line was named after the generic placeholder product the cart
+// actually holds - one per type - so a wheels order read "Wheel" on every
+// line, with the real identity sitting in meta underneath. Built from the
+// same fields the cart and checkout already display.
+function aswb_line_item_name($as) {
+    $brand = trim((string) ($as['brand'] ?? ''));
+    $name  = trim((string) ($as['name'] ?? ''));
+    // The catalog name usually leads with the brand already - do not say it
+    // twice ("Fuel Fuel Rebel").
+    if ($brand !== '' && $name !== '' && stripos($name, $brand) !== 0) {
+        $name = $brand . ' ' . $name;
+    } elseif ($name === '') {
+        $name = $brand;
+    }
+    if ($name === '') $name = trim((string) ($as['sku'] ?? ''));
+    $size = trim((string) ($as['size'] ?? ''));
+    if ($name !== '' && $size !== '' && stripos($name, $size) === false) {
+        $name .= ' - ' . $size;
+    }
+    return $name;
+}
+
 // ── Show the real AutoSync item on cart/checkout and the final order ────────
 add_filter('woocommerce_get_item_data', function ($item_data, $cart_item) {
     $as = $cart_item['autosync'] ?? null;
@@ -1052,11 +1109,39 @@ add_filter('woocommerce_get_item_data', function ($item_data, $cart_item) {
     return $item_data;
 }, 10, 2);
 
+// WooCommerce renders the PRODUCT's thumbnail on an order line, which here is
+// the placeholder product's - the same picture on every line, or none at all.
+// The real one travelled with the item.
+add_filter('woocommerce_order_item_thumbnail', 'aswb_order_item_thumbnail', 10, 2);
+function aswb_order_item_thumbnail($image, $item) {
+    if (!is_object($item) || !method_exists($item, 'get_meta')) return $image;
+    $url = aswb_safe_image_url((string) $item->get_meta('_autosync_image'));
+    if ($url === '') return $image;
+    return '<img src="' . esc_url($url) . '" alt="" style="width:64px;height:64px;object-fit:contain;vertical-align:middle;" />';
+}
+
+// Order emails ship with images off by default, which would leave the line art
+// above rendering nowhere a customer actually looks.
+add_filter('woocommerce_email_order_items_args', function ($args) {
+    $args['show_image'] = true;
+    $args['image_size'] = [64, 64];
+    return $args;
+});
+
 add_action('woocommerce_checkout_create_order_line_item', function ($item, $cart_item_key, $values, $order) {
     $as = $values['autosync'] ?? null;
     if (!$as) return;
-    $item->add_meta_data('AutoSync Part Number', $as['sku']);
-    $item->add_meta_data('AutoSync Brand', $as['brand']);
+    $name = aswb_line_item_name($as);
+    if ($name !== '') $item->set_name($name);
+    // Labels now match what the cart and checkout already show (see
+    // woocommerce_get_item_data above). "AutoSync Part Number" was our
+    // internal wording on a line a customer reads.
+    $item->add_meta_data('Part Number', $as['sku']);
+    $item->add_meta_data('Brand', $as['brand']);
     if ($as['size']) $item->add_meta_data('Size', $as['size']);
     if ($as['vehicle']) $item->add_meta_data('Vehicle', $as['vehicle']);
+    // Underscore-prefixed so WooCommerce keeps it out of the customer's view:
+    // it is read back by the thumbnail filter, not something to read.
+    $image = aswb_safe_image_url($as['image'] ?? '');
+    if ($image !== '') $item->add_meta_data('_autosync_image', $image);
 }, 10, 4);
