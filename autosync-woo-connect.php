@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.3
+ * Version: 0.10.4
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -435,6 +435,71 @@ function aswb_fee_settings() {
     return $live;
 }
 
+// The storefront's own business name, from autosyncadmin via fee-config.php,
+// falling back to this WordPress site's title. Never a literal - this plugin
+// ships to every client, so a name baked in here would be someone else's.
+// Returns '' when neither is set, and every caller must handle that rather
+// than substituting a placeholder.
+function aswb_business_name() {
+    $fees = aswb_fee_settings();
+    $n = isset($fees['businessName']) ? trim((string) $fees['businessName']) : '';
+    if ($n !== '') return $n;
+    return trim((string) get_bloginfo('name'));
+}
+
+// Resolve the install location the customer picked. The browser sends an id;
+// the record itself comes from autosyncadmin, same trust model as the fee
+// amounts. Returns null when it cannot be resolved - an unknown id is a
+// missing location, never a reason to fall back to some other shop's address.
+function aswb_resolve_location($id) {
+    $id = trim((string) $id);
+    $fees = aswb_fee_settings();
+    $rows = (isset($fees['locations']) && is_array($fees['locations'])) ? $fees['locations'] : [];
+    if (!$rows) return null;
+    if ($id !== '') {
+        foreach ($rows as $row) {
+            if (is_array($row) && (string) ($row['id'] ?? '') === $id) return $row;
+        }
+        return null;
+    }
+    // A single-location store whose checkout never sent an id still has exactly
+    // one possible answer. Two or more and we genuinely do not know.
+    return count($rows) === 1 && is_array($rows[0]) ? $rows[0] : null;
+}
+
+// One formatter for a stored location, so the email, the order totals and the
+// admin screen can never drift apart. Returns [] when there is nothing real to
+// print - an empty location is data, not a reason to print anything at all.
+function aswb_location_lines($loc) {
+    if (!is_array($loc)) return [];
+    $out = [];
+    $name = trim((string) ($loc['name'] ?? ''));
+    if ($name !== '') $out[] = $name;
+    $street = trim((string) ($loc['addr'] ?? ''));
+    if ($street !== '') $out[] = $street;
+    $city = trim((string) ($loc['city'] ?? ''));
+    $state = trim((string) ($loc['state'] ?? ''));
+    $zip = trim((string) ($loc['zip'] ?? ''));
+    $line = trim($city . (($city !== '' && $state !== '') ? ', ' : '') . $state);
+    $line = trim($line . ($zip !== '' ? ' ' . $zip : ''));
+    if ($line !== '') $out[] = $line;
+    $phone = trim((string) ($loc['phone'] ?? ''));
+    if ($phone !== '') $out[] = $phone;
+    return $out;
+}
+
+// The install location recorded on an order at checkout time, so an email sent
+// later never depends on a session that is long gone.
+function aswb_order_location($order) {
+    if (!($order instanceof WC_Order)) return null;
+    $loc = $order->get_meta('_autosync_install_location');
+    return is_array($loc) && $loc ? $loc : null;
+}
+
+function aswb_order_is_install($order) {
+    return ($order instanceof WC_Order) && $order->get_meta('_autosync_mode') === 'install';
+}
+
 // ── The store's own rules, which the client does not get a vote on ─────────
 // The mode decides whether an order pays a deposit and whether shipping is
 // charged, so it is worth as much money as the prices themselves - and it was
@@ -537,6 +602,13 @@ add_action('woocommerce_blocks_loaded', function () {
             if (array_key_exists('state', $data)) {
                 WC()->session->set('autosync_state', strtoupper(sanitize_text_field((string) $data['state'])));
             }
+            // WHICH shop the customer picked. An id only - the name, address and
+            // phone that end up on the order are looked up server-side from
+            // autosyncadmin's own locations list (aswb_resolve_location), so a raw
+            // API call cannot write an address of its own onto an order.
+            if (array_key_exists('location_id', $data)) {
+                WC()->session->set('autosync_location_id', sanitize_text_field((string) $data['location_id']));
+            }
             // Deliberately no depositPct here - eligibility and the actual
             // percentage charged are decided entirely server-side (see
             // ASWB_DEPOSIT_PCT below), never accepted from the client. A raw
@@ -602,12 +674,33 @@ add_filter('woocommerce_package_rates', 'aswb_price_shipping_rates', 100, 2);
 function aswb_price_shipping_rates($rates, $package) {
     if (!WC()->cart) return $rates;
     $amount = aswb_shipping_amount(WC()->cart);
+    $mode = aswb_effective_mode();
     foreach ($rates as $rate) {
         $rate->set_cost($amount);
         // Our own flat Sales Tax fee is the only tax on these orders - every
         // fee is added non-taxable for the same reason - so the rate must not
         // pick up WooCommerce's tax engine either.
         $rate->set_taxes([]);
+        if ($mode === 'install') {
+            // Nothing ships on an install order, so the method's own name
+            // ("Standard Shipping") is not merely redundant, it is wrong - the
+            // same reasoning that renamed "Shipping: Shipping" in 0.9.0.
+            // The rate is relabelled rather than removed: the checkout requires
+            // a rate to EXIST at all (checkout/index.php throws "No shipping
+            // method configured on the WooCommerce site" the moment the list
+            // comes back empty), so suppressing the package would break install
+            // checkout rather than tidy an order.
+            $business = aswb_business_name();
+            $rate->set_label(apply_filters(
+                'aswb_install_shipping_label',
+                $business !== '' ? 'Install at ' . $business : 'Install in store',
+                $rate,
+                $package
+            ));
+            // ...and deliberately no "Items:" meta below: a list of what is in
+            // the box only means something when there is a box.
+            continue;
+        }
         if ($amount > 0) {
             // 0.9.0 set this to "Shipping". The order email prints the method
             // name under its own "Shipping:" heading, so it read
@@ -879,6 +972,23 @@ function aswb_sync_parent_on_deposit_paid($order_id) {
     if (!$parent->has_status('aswb-deposit-paid')) {
         $parent->update_status('aswb-deposit-paid', '');
     }
+    // WooCommerce binds every transactional email to a fixed list of status
+    // TRANSITIONS, not to a status: WC_Email_New_Order's constructor hooks
+    // exactly nine, all of them ending in processing/completed/on-hold (read
+    // off core, not remembered). pending -> aswb-deposit-paid is in none of
+    // them, so until 0.10.4 an install order told nobody - not the shop, not
+    // the customer - while a ship order mailed both. Trigger them by hand.
+    $mailer = function_exists('WC') ? WC()->mailer() : null;
+    $mails = $mailer ? $mailer->get_emails() : [];
+    if (isset($mails['WC_Email_New_Order'])) {
+        // Safe to reach twice: core keeps its own _new_order_email_sent guard,
+        // and a 3DS return and a webhook can both land here for one payment.
+        $mails['WC_Email_New_Order']->trigger($parent->get_id(), $parent);
+    }
+    if (isset($mails['ASWB_Email_Customer_Deposit'])) {
+        $mails['ASWB_Email_Customer_Deposit']->trigger($parent->get_id(), $parent);
+    }
+
     $parent->add_order_note(sprintf(
         'Deposit checkout: $%s charged via Stripe (Order #%s). $%s balance due at install - collect separately, this plugin does not charge it automatically.',
         number_format((float) $parent->get_meta('_autosync_deposit_amount'), 2),
@@ -914,7 +1024,7 @@ add_filter('woocommerce_my_account_my_orders_query', function ($args) {
     $args['meta_query'][] = ['key' => '_autosync_deposit_payment', 'compare' => 'NOT EXISTS'];
     return $args;
 });
-foreach (['new_order', 'customer_processing_order', 'customer_completed_order', 'customer_on_hold_order', 'customer_invoice'] as $aswbEmailId) {
+foreach (['new_order', 'customer_processing_order', 'customer_completed_order', 'customer_on_hold_order', 'customer_invoice', 'aswb_customer_deposit'] as $aswbEmailId) {
     add_filter("woocommerce_email_enabled_{$aswbEmailId}", function ($enabled, $order) {
         if ($order instanceof WC_Order && $order->get_meta('_autosync_deposit_payment') === 'yes') return false;
         return $enabled;
@@ -965,6 +1075,271 @@ add_action('woocommerce_admin_order_data_after_order_details', function ($order)
     </div>
     <?php
 });
+
+// ── Record mode + install location ON THE ORDER ────────────────────────
+// Hook name confirmed against WooCommerce's own StoreApi/Routes/V1/Checkout.php:
+// it fires inside create_or_update_draft_order(), before payment, with the
+// order as its only argument. The session is the wrong place to read this back
+// from later - a 3DS return or a webhook arrives without one.
+add_action('woocommerce_store_api_checkout_update_order_meta', 'aswb_record_mode_on_order', 10, 1);
+function aswb_record_mode_on_order($order) {
+    if (!($order instanceof WC_Order)) return;
+    $mode = aswb_effective_mode();
+    $order->update_meta_data('_autosync_mode', $mode);
+    if ($mode === 'install') {
+        $id = WC()->session ? (string) WC()->session->get('autosync_location_id', '') : '';
+        $loc = aswb_resolve_location($id);
+        if ($loc) $order->update_meta_data('_autosync_install_location', $loc);
+    }
+    $order->save();
+}
+
+// ── The totals block: what was actually collected, and where it is going ──
+// Filter signature confirmed against WC_Abstract_Order::get_order_item_totals().
+// This one filter reaches the customer email, the admin email, the order-received
+// page and My Account together, so the figure can never say one thing in an
+// email and another on a page.
+add_filter('woocommerce_get_order_item_totals', 'aswb_order_item_totals', 10, 2);
+function aswb_order_item_totals($rows, $order) {
+    if (!is_array($rows) || !($order instanceof WC_Order)) return $rows;
+
+    if (aswb_order_is_install($order) && isset($rows['shipping'])) {
+        $business = aswb_business_name();
+        $rows['shipping']['label'] = 'Installation:';
+        $rows['shipping']['value'] = $business !== '' ? 'Install at ' . $business : 'Install in store';
+        // 'meta' carries the shipping METHOD name, and the email template
+        // rewrites a row to "Free!" when value and meta are equal on a free
+        // method - which would throw this label away. Dropping meta here is
+        // what keeps the line readable; checked against the template, not
+        // assumed.
+        unset($rows['shipping']['meta']);
+    }
+
+    $deposit = (float) $order->get_meta('_autosync_deposit_amount');
+    if ($deposit <= 0) return $rows;
+    $balance = (float) $order->get_meta('_autosync_balance_due');
+
+    // A deposit order's "Total" is the full value of the goods, which is right -
+    // but on its own it reads as the amount charged. These two rows say what was
+    // taken and what is left, and the second one changes wording once staff mark
+    // the order complete, so the "Completed order" email WooCommerce sends after
+    // installation does not still ask for money already collected.
+    $add = [];
+    $add['aswb_deposit'] = [
+        'type' => 'aswb_deposit',
+        'label' => 'Deposit paid:',
+        'value' => wc_price($deposit, ['currency' => $order->get_currency()]),
+    ];
+    if ($balance > 0) {
+        $settled = $order->has_status(['completed', 'refunded']);
+        $add['aswb_balance'] = [
+            'type' => 'aswb_balance',
+            'label' => $settled ? 'Balance paid at install:' : 'Balance due at install:',
+            'value' => wc_price($balance, ['currency' => $order->get_currency()]),
+        ];
+    }
+
+    // Insert immediately after the total, preserving every other row's order.
+    $out = [];
+    foreach ($rows as $k => $v) {
+        $out[$k] = $v;
+        if ($k === 'order_total') $out += $add;
+    }
+    if (!isset($out['aswb_deposit'])) $out += $add; // no order_total row - append
+    return $out;
+}
+
+// ── The deposit summary, above the item table in every order email ──────
+// Hooked where both the HTML and the PLAIN-TEXT order-details templates fire it
+// (checked in both), so this renders in either - the admin's "New order" mail
+// and the customer's deposit mail alike, each told apart by $sent_to_admin.
+add_action('woocommerce_email_before_order_table', 'aswb_email_deposit_block', 10, 4);
+function aswb_email_deposit_block($order, $sent_to_admin, $plain_text, $email) {
+    if (!($order instanceof WC_Order)) return;
+    $deposit = (float) $order->get_meta('_autosync_deposit_amount');
+    if ($deposit <= 0) return;
+    $full = (float) $order->get_meta('_autosync_full_total');
+    $balance = (float) $order->get_meta('_autosync_balance_due');
+    $settled = $order->has_status(['completed', 'refunded']);
+    $cur = ['currency' => $order->get_currency()];
+
+    // Kept as wc_price()'s own HTML. Stripping the tags here would leave the
+    // currency symbol as the raw entity wc_price() emits ("&#36;"), which
+    // esc_html() then turns into visible "&amp;#36;" - so each branch below
+    // renders it the way that branch actually needs.
+    $pairs = [];
+    if ($full > 0) $pairs[] = ['Order total', wc_price($full, $cur)];
+    $pairs[] = ['Deposit paid today', wc_price($deposit, $cur)];
+    if ($balance > 0) {
+        $pairs[] = [$settled ? 'Balance paid at install' : 'Balance due at install',
+                    wc_price($balance, $cur)];
+    }
+
+    $locLines = aswb_location_lines(aswb_order_location($order));
+    // The next step belongs to the customer, not to the shop that is taking it.
+    $next = (!$sent_to_admin && !$settled) ? aswb_install_next_step() : '';
+
+    if ($plain_text) {
+        echo "\n" . ($settled ? 'DEPOSIT SUMMARY' : 'DEPOSIT PAID — BALANCE DUE AT INSTALL') . "\n";
+        foreach ($pairs as $p) {
+            echo $p[0] . ': ' . html_entity_decode(wp_strip_all_tags($p[1]), ENT_QUOTES, 'UTF-8') . "\n";
+        }
+        if ($locLines) {
+            echo "\n" . 'Install location:' . "\n";
+            foreach ($locLines as $l) echo $l . "\n";
+        }
+        if ($next !== '') echo "\n" . $next . "\n";
+        echo "\n----------------------------------------\n\n";
+        return;
+    }
+
+    echo '<div style="margin:0 0 24px;padding:16px 18px;border:1px solid #e4e4e4;border-radius:6px;">';
+    echo '<p style="margin:0 0 10px;font-weight:600;">'
+        . esc_html($settled ? 'Deposit summary' : 'Deposit paid — balance due at install')
+        . '</p>';
+    echo '<table cellspacing="0" cellpadding="3" border="0" style="width:100%;">';
+    foreach ($pairs as $p) {
+        echo '<tr><td style="text-align:left;">' . esc_html($p[0]) . '</td>'
+            . '<td style="text-align:right;white-space:nowrap;">' . wp_kses_post($p[1]) . '</td></tr>';
+    }
+    echo '</table>';
+    if ($locLines) {
+        echo '<p style="margin:12px 0 0;"><strong>' . esc_html('Install location') . '</strong><br>'
+            . implode('<br>', array_map('esc_html', $locLines)) . '</p>';
+    }
+    if ($next !== '') echo '<p style="margin:12px 0 0;">' . esc_html($next) . '</p>';
+    echo '</div>';
+}
+
+// What happens next after a deposit. Filterable so a shop that does not work
+// this way can say what it actually does, rather than this being a promise
+// made on its behalf.
+function aswb_install_next_step() {
+    return (string) apply_filters(
+        'aswb_install_next_step',
+        "We'll call you within 24 hours to schedule your install."
+    );
+}
+
+// ── The customer's deposit confirmation ──────────────────────────
+// WooCommerce has no email for "took a deposit, rest due in person", and every
+// stock email is bound to a status TRANSITION it will never see (see the
+// trigger in aswb_sync_parent_on_deposit_paid). Registering a real WC_Email
+// rather than calling wp_mail() gets this a row under WooCommerce > Settings >
+// Emails, with the subject, heading and closing text editable per store, and
+// the store's own email branding for free.
+add_filter('woocommerce_email_classes', 'aswb_register_email_classes');
+function aswb_register_email_classes($emails) {
+    if (!class_exists('WC_Email')) return $emails;
+    aswb_define_deposit_email();
+    $emails['ASWB_Email_Customer_Deposit'] = new ASWB_Email_Customer_Deposit();
+    return $emails;
+}
+
+function aswb_define_deposit_email() {
+    if (class_exists('ASWB_Email_Customer_Deposit', false)) return;
+
+    class ASWB_Email_Customer_Deposit extends WC_Email {
+        public function __construct() {
+            $this->id = 'aswb_customer_deposit';
+            $this->customer_email = true;
+            $this->title = 'Deposit received (install order)';
+            $this->description = 'Sent to the customer when an install order\'s deposit is paid. '
+                . 'The balance is collected in the shop, so WooCommerce sends nothing for this on its own.';
+            $this->placeholders = [
+                '{order_date}' => '',
+                '{order_number}' => '',
+                '{business}' => '',
+            ];
+            parent::__construct();
+        }
+
+        public function get_default_subject() {
+            return 'Your install at {business} is reserved - order #{order_number}';
+        }
+
+        public function get_default_heading() {
+            return 'Your install is reserved';
+        }
+
+        public function get_default_additional_content() {
+            return 'Questions before your install? Just reply to this email.';
+        }
+
+        public function trigger($order_id, $order = false) {
+            $this->setup_locale();
+            if ($order_id && !is_a($order, 'WC_Order')) $order = wc_get_order($order_id);
+            if (is_a($order, 'WC_Order')) {
+                // Same guard core keeps on its own New Order mail: a 3DS return
+                // and a webhook can both reach the trigger for one payment.
+                if ($order->get_meta('_aswb_deposit_email_sent') === 'yes') {
+                    $this->restore_locale();
+                    return;
+                }
+                $this->object = $order;
+                $this->recipient = $order->get_billing_email();
+                $this->placeholders['{order_date}'] = wc_format_datetime($order->get_date_created());
+                $this->placeholders['{order_number}'] = $order->get_order_number();
+                $business = aswb_business_name();
+                $this->placeholders['{business}'] = $business !== '' ? $business : $this->get_blogname();
+            }
+            $sent = false;
+            if ($this->is_enabled() && $this->get_recipient()) {
+                $sent = $this->send($this->get_recipient(), $this->get_subject(), $this->get_content(), $this->get_headers(), $this->get_attachments());
+            }
+            if ($sent && is_a($this->object, 'WC_Order')) {
+                $this->object->update_meta_data('_aswb_deposit_email_sent', 'yes');
+                $this->object->save();
+            }
+            $this->restore_locale();
+        }
+
+        public function get_content_html() { return $this->aswb_render(false); }
+        public function get_content_plain() { return $this->aswb_render(true); }
+
+        // Composed from WooCommerce's own email actions rather than a template
+        // file of our own, so the store's header, footer, item table (including
+        // the line names, Part Number/Brand/Size labels and thumbnails this
+        // plugin already supplies) and address block all come through unchanged.
+        protected function aswb_render($plain) {
+            $order = $this->object;
+            $first = is_a($order, 'WC_Order') ? $order->get_billing_first_name() : '';
+            $intro = 'Thanks - your deposit is in and your set is reserved. '
+                . 'The balance is due when we fit them.';
+            ob_start();
+            if ($plain) {
+                echo "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n";
+                echo esc_html(wp_strip_all_tags($this->get_heading()));
+                echo "\n=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n\n";
+                if ($first !== '') echo esc_html(sprintf('Hi %s,', $first)) . "\n\n";
+                echo esc_html($intro) . "\n\n";
+            } else {
+                do_action('woocommerce_email_header', $this->get_heading(), $this);
+                if ($first !== '') echo '<p>' . esc_html(sprintf('Hi %s,', $first)) . '</p>';
+                echo '<p>' . esc_html($intro) . '</p>';
+            }
+            do_action('woocommerce_email_order_details', $order, false, $plain, $this);
+            do_action('woocommerce_email_order_meta', $order, false, $plain, $this);
+            do_action('woocommerce_email_customer_details', $order, false, $plain, $this);
+            $extra = $this->get_additional_content();
+            if ($extra) {
+                if ($plain) {
+                    echo "\n----------------------------------------\n\n";
+                    echo esc_html(wp_strip_all_tags(wptexturize($extra))) . "\n\n";
+                } else {
+                    echo wpautop(wptexturize($extra));
+                }
+            }
+            if ($plain) {
+                echo "\n" . esc_html(wp_strip_all_tags(apply_filters('woocommerce_email_footer_text', get_option('woocommerce_email_footer_text'))));
+            } else {
+                do_action('woocommerce_email_footer', $this);
+            }
+            return ob_get_clean();
+        }
+    }
+}
+
 
 function aswb_maybe_send_cors_headers($route) {
     if (strpos($route, '/wc/store/') === false) return;
