@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.2
+ * Version: 0.10.3
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -626,6 +626,29 @@ function aswb_price_shipping_rates($rates, $package) {
                 $rate->set_label(apply_filters('aswb_shipping_label', 'Standard shipping', $rate, $package));
             }
         }
+        // WooCommerce builds the rate's "Items" meta from each line's PRODUCT
+        // name, which here is the generic placeholder, so the shipping line on
+        // the order read "Autosync Tires &times; 4, Autosync Wheels &times; 1".
+        // Rebuild it from the real AutoSync items - the same names the order
+        // lines themselves carry. The rate's meta is where this lives: it is
+        // copied onto the shipping order item later, so fixing it here fixes
+        // the cart, the checkout, the order and the emails in one place.
+        if (method_exists($rate, 'add_meta_data')) {
+            $names = [];
+            foreach ((array) ($package['contents'] ?? []) as $ci) {
+                $as = $ci['autosync'] ?? null;
+                $nm = $as ? aswb_line_item_name($as) : '';
+                if ($nm === '' && isset($ci['data']) && is_object($ci['data'])
+                    && method_exists($ci['data'], 'get_name')) {
+                    $nm = (string) $ci['data']->get_name();
+                }
+                if ($nm === '') continue;
+                $names[] = $nm . ' &times; ' . (int) ($ci['quantity'] ?? 0);
+            }
+            if ($names) {
+                $rate->add_meta_data(__('Items', 'woocommerce'), implode(', ', $names));
+            }
+        }
     }
     return $rates;
 }
@@ -1129,16 +1152,29 @@ add_filter('woocommerce_get_item_data', function ($item_data, $cart_item) {
 // the placeholder product's - the same picture on every line, or none at all.
 // The real one travelled with the item.
 add_filter('woocommerce_order_item_thumbnail', 'aswb_order_item_thumbnail', 10, 2);
-function aswb_order_item_thumbnail($image, $item) {
-    if (!is_object($item) || !method_exists($item, 'get_meta')) return $image;
+// The email and the admin screen want very different sizes, so build the tag
+// once and let each caller say how big. (0.10.2 returned the 64px email image
+// to the admin screen too, where the .thumb cell is about 38px - it overflowed
+// its grey box and ran across the item name.)
+//
+// On object-fit: WordPress's kses DOES allow it, so it survives wp_kses_post
+// in both callers. It is used for the admin, which renders in a real browser.
+// It is deliberately NOT used for the email, where Outlook and Gmail ignore it
+// and a fixed square would squash a non-square catalog shot; there, height:auto
+// cannot distort anything, and the width ATTRIBUTE still gives Outlook a size.
+function aswb_item_image_tag($item, $fallback, $px, $fit) {
+    if (!is_object($item) || !method_exists($item, 'get_meta')) return $fallback;
     $url = aswb_safe_image_url((string) $item->get_meta('_autosync_image'));
-    if ($url === '') return $image;
-    // Both callers run this through wp_kses_post(), which strips any CSS
-    // property missing from WordPress's own allow-list. height:auto cannot
-    // distort a non-square catalog shot whatever survives that pass, and the
-    // width ATTRIBUTE gives Outlook a size even when the style is dropped
-    // entirely - object-fit:contain would have been silently load-bearing.
-    return '<img src="' . esc_url($url) . '" alt="" width="64" style="width:64px;height:auto;vertical-align:middle;" />';
+    if ($url === '') return $fallback;
+    $px = (int) $px;
+    $style = $fit
+        ? 'width:' . $px . 'px;height:' . $px . 'px;object-fit:contain;vertical-align:middle;'
+        : 'width:' . $px . 'px;height:auto;vertical-align:middle;';
+    return '<img src="' . esc_url($url) . '" alt="" width="' . $px . '" style="' . esc_attr($style) . '" />';
+}
+
+function aswb_order_item_thumbnail($image, $item) {
+    return aswb_item_image_tag($item, $image, 64, false);
 }
 
 // The admin order screen does NOT use the filter above - confirmed in
@@ -1149,8 +1185,18 @@ function aswb_order_item_thumbnail($image, $item) {
 // customer's email shows the real wheel.
 add_filter('woocommerce_admin_order_item_thumbnail', 'aswb_admin_order_item_thumbnail', 10, 3);
 function aswb_admin_order_item_thumbnail($thumbnail, $item_id, $item) {
-    return aswb_order_item_thumbnail($thumbnail, $item);
+    return aswb_item_image_tag($item, $thumbnail, 38, true);
 }
+
+// The admin order screen does NOT hide item meta by underscore prefix. The
+// underscore only hides a key from the CUSTOMER-facing views; on the admin
+// side the template skips exact matches against
+// OrderItemMetaUtil::get_hidden_keys(), a fixed 12-key list, so
+// _autosync_image was printed on every line as a raw URL.
+add_filter('woocommerce_hidden_order_itemmeta', function ($keys) {
+    $keys[] = '_autosync_image';
+    return $keys;
+});
 
 // Order emails ship with images off by default, which would leave the line art
 // above rendering nowhere a customer actually looks.
