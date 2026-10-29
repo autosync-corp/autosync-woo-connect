@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.1
+ * Version: 0.10.2
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -1133,7 +1133,23 @@ function aswb_order_item_thumbnail($image, $item) {
     if (!is_object($item) || !method_exists($item, 'get_meta')) return $image;
     $url = aswb_safe_image_url((string) $item->get_meta('_autosync_image'));
     if ($url === '') return $image;
-    return '<img src="' . esc_url($url) . '" alt="" style="width:64px;height:64px;object-fit:contain;vertical-align:middle;" />';
+    // Both callers run this through wp_kses_post(), which strips any CSS
+    // property missing from WordPress's own allow-list. height:auto cannot
+    // distort a non-square catalog shot whatever survives that pass, and the
+    // width ATTRIBUTE gives Outlook a size even when the style is dropped
+    // entirely - object-fit:contain would have been silently load-bearing.
+    return '<img src="' . esc_url($url) . '" alt="" width="64" style="width:64px;height:auto;vertical-align:middle;" />';
+}
+
+// The admin order screen does NOT use the filter above - confirmed in
+// includes/admin/meta-boxes/views/html-order-item.php, which applies
+// 'woocommerce_admin_order_item_thumbnail' ($thumbnail, $item_id, $item)
+// around $product->get_image() instead. Without this, the shop owner keeps
+// seeing the placeholder product's blank square on every line while the
+// customer's email shows the real wheel.
+add_filter('woocommerce_admin_order_item_thumbnail', 'aswb_admin_order_item_thumbnail', 10, 3);
+function aswb_admin_order_item_thumbnail($thumbnail, $item_id, $item) {
+    return aswb_order_item_thumbnail($thumbnail, $item);
 }
 
 // Order emails ship with images off by default, which would leave the line art
