@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.7
+ * Version: 0.10.8
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -761,6 +761,75 @@ function aswb_mode_in_shipping_package($packages) {
     return $packages;
 }
 
+// ── US state codes, and everything a human might write instead ────────────
+// The rate is chosen by an EXACT match against 2-letter codes, so anything
+// else - "California", "Calif.", "ca " - matches no override row and silently
+// takes the DEFAULT rate. On a client whose only real rate lives in an
+// override, that default is 0%.
+//
+// This is the PHP twin of normalizeState() in js/setup.js and the two tables
+// have to stay in step, which is why both are generated from one list of
+// names rather than two hand-written lists of codes. The storefront's State
+// box is now a <select> and cannot produce a bad value, but this form is not
+// the only way a state reaches an order: a Woo-side admin order, a returning
+// customer's saved address and the plugin's own fallback settings textarea
+// (which has no 2-character limit) all bypass it.
+function aswb_us_states() {
+    return [
+        'AL' => 'Alabama', 'AK' => 'Alaska', 'AZ' => 'Arizona', 'AR' => 'Arkansas',
+        'CA' => 'California', 'CO' => 'Colorado', 'CT' => 'Connecticut',
+        'DE' => 'Delaware', 'DC' => 'District of Columbia', 'FL' => 'Florida',
+        'GA' => 'Georgia', 'HI' => 'Hawaii', 'ID' => 'Idaho', 'IL' => 'Illinois',
+        'IN' => 'Indiana', 'IA' => 'Iowa', 'KS' => 'Kansas', 'KY' => 'Kentucky',
+        'LA' => 'Louisiana', 'ME' => 'Maine', 'MD' => 'Maryland',
+        'MA' => 'Massachusetts', 'MI' => 'Michigan', 'MN' => 'Minnesota',
+        'MS' => 'Mississippi', 'MO' => 'Missouri', 'MT' => 'Montana',
+        'NE' => 'Nebraska', 'NV' => 'Nevada', 'NH' => 'New Hampshire',
+        'NJ' => 'New Jersey', 'NM' => 'New Mexico', 'NY' => 'New York',
+        'NC' => 'North Carolina', 'ND' => 'North Dakota', 'OH' => 'Ohio',
+        'OK' => 'Oklahoma', 'OR' => 'Oregon', 'PA' => 'Pennsylvania',
+        'RI' => 'Rhode Island', 'SC' => 'South Carolina', 'SD' => 'South Dakota',
+        'TN' => 'Tennessee', 'TX' => 'Texas', 'UT' => 'Utah', 'VT' => 'Vermont',
+        'VA' => 'Virginia', 'WA' => 'Washington', 'WV' => 'West Virginia',
+        'WI' => 'Wisconsin', 'WY' => 'Wyoming',
+        'AS' => 'American Samoa', 'GU' => 'Guam',
+        'MP' => 'Northern Mariana Islands', 'PR' => 'Puerto Rico',
+        'VI' => 'U.S. Virgin Islands',
+        'AA' => 'Armed Forces (AA)', 'AE' => 'Armed Forces (AE)',
+        'AP' => 'Armed Forces (AP)',
+    ];
+}
+
+// A 2-letter US state code, or '' when the input names no state we know.
+// '' is deliberate: it is the same answer an empty box gives - "not told yet" -
+// and it takes the default rate rather than guessing.
+function aswb_normalize_state($raw) {
+    static $map = null;
+    if ($map === null) {
+        $map = [];
+        foreach (aswb_us_states() as $code => $name) {
+            $map[$code] = $code;
+            $map[preg_replace('/[^A-Z]/', '', strtoupper($name))] = $code;
+        }
+        // "Washington DC" strips to WASHINGTONDC, which would otherwise miss
+        // entirely - and must NOT be allowed to fall back to WASHINGTON (WA).
+        $map['WASHINGTONDC'] = 'DC';
+        $map += [
+            'CALIF' => 'CA', 'CAL' => 'CA', 'ALA' => 'AL', 'ARIZ' => 'AZ',
+            'ARK' => 'AR', 'COLO' => 'CO', 'CONN' => 'CT', 'DEL' => 'DE',
+            'FLA' => 'FL', 'ILL' => 'IL', 'IND' => 'IN', 'KAN' => 'KS',
+            'KANS' => 'KS', 'MASS' => 'MA', 'MICH' => 'MI', 'MINN' => 'MN',
+            'MISS' => 'MS', 'MONT' => 'MT', 'NEB' => 'NE', 'NEBR' => 'NE',
+            'NEV' => 'NV', 'OKLA' => 'OK', 'ORE' => 'OR', 'OREG' => 'OR',
+            'PENN' => 'PA', 'PENNA' => 'PA', 'TENN' => 'TN', 'WASH' => 'WA',
+            'WISC' => 'WI', 'WIS' => 'WI', 'WYO' => 'WY', 'WVA' => 'WV',
+            'NDAK' => 'ND', 'SDAK' => 'SD',
+        ];
+    }
+    $k = preg_replace('/[^A-Z]/', '', strtoupper((string) $raw));
+    return ($k !== '' && isset($map[$k])) ? $map[$k] : '';
+}
+
 // ── The state that decides the sales tax, resolved server-side ────────────
 // This used to be whatever the browser POSTed to /cart/extensions, and that
 // is how a Nevada order came to be charged 7.25% California tax: the
@@ -782,14 +851,14 @@ function aswb_taxable_state($mode) {
     if ($mode === 'install') {
         $id = WC()->session ? (string) WC()->session->get('autosync_location_id', '') : '';
         $loc = aswb_resolve_location($id);
-        return $loc ? strtoupper(trim((string) ($loc['state'] ?? ''))) : '';
+        return $loc ? aswb_normalize_state($loc['state'] ?? '') : '';
     }
     if (!WC()->customer) return '';
     $state = (string) WC()->customer->get_shipping_state();
     // A store configured to ship to the billing address only never populates
     // the shipping fields; that order still ships somewhere real.
     if (trim($state) === '') $state = (string) WC()->customer->get_billing_state();
-    return strtoupper(trim($state));
+    return aswb_normalize_state($state);
 }
 
 add_action('woocommerce_cart_calculate_fees', 'aswb_apply_fees', 10, 1);
@@ -818,8 +887,18 @@ function aswb_apply_fees($cart) {
 
     if ($fees['salesTaxEnabled']) {
         $subtotal = $cart->get_subtotal();
-        $overrides = $fees['salesTaxStateOverrides'] ?: [];
-        $rate = $overrides[$state] ?? (float) $fees['salesTaxDefaultRate'];
+        // The override keys are typed by a human too - autosyncadmin's State
+        // box, or the plugin's own settings textarea, which has no length
+        // limit at all - so both sides of the comparison are normalised, not
+        // just the one coming from the order. A key we cannot read normalises
+        // to '' and is skipped rather than matching an unknown state.
+        $rate = (float) $fees['salesTaxDefaultRate'];
+        foreach (($fees['salesTaxStateOverrides'] ?: []) as $key => $pct) {
+            if ($state !== '' && aswb_normalize_state($key) === $state) {
+                $rate = (float) $pct;
+                break;
+            }
+        }
         $tax = round($subtotal * ($rate / 100), 2);
         if ($tax > 0) $cart->add_fee('Sales Tax', $tax, false);
     }
