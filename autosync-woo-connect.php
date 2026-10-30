@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.6
+ * Version: 0.10.7
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -599,9 +599,11 @@ add_action('woocommerce_blocks_loaded', function () {
             if (isset($data['mode']) && in_array($data['mode'], ['install', 'ship'], true)) {
                 WC()->session->set('autosync_mode', sanitize_text_field($data['mode']));
             }
-            if (array_key_exists('state', $data)) {
-                WC()->session->set('autosync_state', strtoupper(sanitize_text_field((string) $data['state'])));
-            }
+            // 'state' is still accepted and deliberately ignored. The checkout
+            // sends it, and an older cached checkout will keep sending it, but
+            // nothing reads it any more: the tax state is resolved server-side
+            // by aswb_taxable_state(). It was trusted once and charged a
+            // Nevada customer California tax - see that function.
             // WHICH shop the customer picked. An id only - the name, address and
             // phone that end up on the order are looked up server-side from
             // autosyncadmin's own locations list (aswb_resolve_location), so a raw
@@ -759,12 +761,43 @@ function aswb_mode_in_shipping_package($packages) {
     return $packages;
 }
 
+// ── The state that decides the sales tax, resolved server-side ────────────
+// This used to be whatever the browser POSTed to /cart/extensions, and that
+// is how a Nevada order came to be charged 7.25% California tax: the
+// storefront pre-filled its own shop state into a shipping form that stays
+// hidden while "Same as billing" is ticked, then sent it. The frontend bug is
+// fixed, but a session value written by a client call was never a fact about
+// the order, and a cached older checkout would still send the old one.
+//
+// Both answers are already on the server without having to ask for them:
+//   ship    - the customer's shipping address. The checkout sets it through
+//             /cart/update-customer one call BEFORE it sends the fee context,
+//             so it is present and correct by the time fees are calculated.
+//   install - the shop the customer picked, looked up from autosyncadmin's own
+//             list by id, exactly as aswb_record_mode_on_order stamps it on
+//             the order.
+// Neither can be steered by a crafted API call, which is the rule the deposit
+// percentage and the store address already follow.
+function aswb_taxable_state($mode) {
+    if ($mode === 'install') {
+        $id = WC()->session ? (string) WC()->session->get('autosync_location_id', '') : '';
+        $loc = aswb_resolve_location($id);
+        return $loc ? strtoupper(trim((string) ($loc['state'] ?? ''))) : '';
+    }
+    if (!WC()->customer) return '';
+    $state = (string) WC()->customer->get_shipping_state();
+    // A store configured to ship to the billing address only never populates
+    // the shipping fields; that order still ships somewhere real.
+    if (trim($state) === '') $state = (string) WC()->customer->get_billing_state();
+    return strtoupper(trim($state));
+}
+
 add_action('woocommerce_cart_calculate_fees', 'aswb_apply_fees', 10, 1);
 function aswb_apply_fees($cart) {
     if (is_admin() && !defined('DOING_AJAX')) return;
 
     $mode = aswb_effective_mode();
-    $state = WC()->session ? WC()->session->get('autosync_state', '') : '';
+    $state = aswb_taxable_state($mode);
 
     list($tireQty, $wheelQty) = aswb_cart_quantities($cart);
 
