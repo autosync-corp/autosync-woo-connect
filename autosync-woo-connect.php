@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.5
+ * Version: 0.10.6
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -344,7 +344,6 @@ function aswb_render_settings_page() {
       <hr>
       <h2>Price Verification Debug Log <span style="font-weight:normal; font-size:13px; color:#666;">(temporary - tracking down a real mispricing incident)</span></h2>
       <p>Every cart/checkout price calculation logs one row per AutoSync line item here (newest first, capped at 60). If a line item is ever missing its AutoSync metadata, it shows up as <code>no_autosync_metadata</code> instead of <code>priced</code> - that's the case that can silently charge the generic product's raw placeholder price.</p>
-      <p><strong>Also temporary (0.10.5):</strong> every order email sent logs one <code>email_totals_trace</code> row, to track down the customer &quot;Processing order&quot; mail printing its totals block twice. Read it in <em>Other fields</em>: <code>totals_built</code> is how many times a totals table was composed, <code>tables_in_html</code> how many reached the sent message. <code>2</code> and <code>2</code> means something renders it twice; <code>1</code> and <code>2</code> means one render whose markup is being copied. The row also records whether Email improvements was on and which WooCommerce version sent it.</p>
       <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:10px;">
         <input type="hidden" name="action" value="aswb_clear_price_debug_log">
         <?php wp_nonce_field('aswb_clear_price_debug_log'); ?>
@@ -1179,81 +1178,6 @@ function aswb_order_item_totals($rows, $order) {
     if (!isset($out['aswb_deposit'])) $out += $add; // no order_total row - append
     return $out;
 }
-
-// ── TEMPORARY instrumentation: the duplicated totals block ─────────
-// The customer "Processing order" mail prints the order totals twice (orders
-// #18 and #26) while the admin mail and our own deposit mail print them once.
-// Everything below only measures; it changes no output. Remove it, and its row
-// on the settings page, once the cause is found.
-//
-// Two independent numbers per sent email, which between them separate the two
-// possible explanations without any output buffering:
-//
-//   totals_built   - how many times a totals table was actually composed,
-//                    counted at woocommerce_get_order_item_totals, which the
-//                    template calls exactly once per table it renders.
-//   tables_in_html - how many totals tables survive into the sent HTML, counted
-//                    by the one class the template puts on each table's last row.
-//
-//   2 and 2 -> something renders the table twice (a template or a hook).
-//   1 and 2 -> one render, duplicated markup: a wrapper, buffer or filter is
-//              copying it, which is a different bug with a different fix.
-//
-// details_fired counts woocommerce_email_order_details firings for the same
-// email, which tells us whether a second render sits inside that action (so a
-// hook) or outside it (so the template itself).
-$GLOBALS['aswb_email_trace'] = ['email' => '', 'totals_built' => 0, 'details_fired' => 0];
-
-add_filter('woocommerce_get_order_item_totals', 'aswb_trace_totals_built', 1, 1);
-function aswb_trace_totals_built($rows) {
-    $GLOBALS['aswb_email_trace']['totals_built']++;
-    return $rows;
-}
-
-add_action('woocommerce_email_order_details', 'aswb_trace_details_fired', 1, 4);
-function aswb_trace_details_fired($order, $sent_to_admin, $plain_text, $email) {
-    // Zero the render count when an email BEGINS, not only when one ends.
-    // WC_Email::handle_multipart() composes the plain-text body on
-    // phpmailer_init, which runs inside wp_mail() - after
-    // woocommerce_mail_content has already logged and reset. Without this, that
-    // trailing plain render would be counted against the NEXT email sent in the
-    // same request, which is exactly the false "rendered twice" this is meant
-    // to detect.
-    if ($GLOBALS['aswb_email_trace']['details_fired'] === 0) {
-        $GLOBALS['aswb_email_trace']['totals_built'] = 0;
-    }
-    $GLOBALS['aswb_email_trace']['details_fired']++;
-    if (is_object($email) && isset($email->id)) {
-        $GLOBALS['aswb_email_trace']['email'] = (string) $email->id;
-    }
-}
-
-// Fires once per email, on the final styled HTML, immediately before wp_mail().
-add_filter('woocommerce_mail_content', 'aswb_trace_mail_content', 999, 1);
-function aswb_trace_mail_content($content) {
-    $t = $GLOBALS['aswb_email_trace'];
-    // The template tags the last row of each totals table with this class, so
-    // one occurrence means one table. Confirmed in email-order-details.php.
-    $tables = substr_count((string) $content, 'order-totals-last');
-    if ($t['details_fired'] > 0 || $tables > 0) {
-        $cls = 'Automattic\WooCommerce\Utilities\FeaturesUtil';
-        $improvements = '?';
-        if (class_exists($cls)) {
-            $improvements = call_user_func([$cls, 'feature_is_enabled'], 'email_improvements') ? 'on' : 'off';
-        }
-        aswb_debug_log('email_totals_trace', [
-            'email_id' => $t['email'],
-            'totals_built' => $t['totals_built'],
-            'details_fired' => $t['details_fired'],
-            'tables_in_html' => $tables,
-            'improvements' => $improvements,
-            'wc' => defined('WC_VERSION') ? WC_VERSION : '?',
-        ]);
-    }
-    $GLOBALS['aswb_email_trace'] = ['email' => '', 'totals_built' => 0, 'details_fired' => 0];
-    return $content;
-}
-
 
 // ── The deposit summary, above the item table in every order email ──────
 // Hooked where both the HTML and the PLAIN-TEXT order-details templates fire it
