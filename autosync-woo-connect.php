@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.8
+ * Version: 0.10.9
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -861,6 +861,61 @@ function aswb_taxable_state($mode) {
     return aswb_normalize_state($state);
 }
 
+// ── An install order that cannot say which shop it is for is refused ──────
+// Same rule as the price check: stop rather than guess. An unidentified shop
+// used to fall through to the DEFAULT tax rate and an order with no
+// _autosync_install_location on it - so nobody could tell where to fit the
+// tires, and the tax was whatever the default happened to be. Both are
+// silent, which is the property that made the same-as-billing bug expensive.
+//
+// Three ways it can happen, all refused:
+//   - two or more shops and no location_id in the session. This is the real
+//     one: `origin/master`'s js/cart.js does not send location_id at all (it
+//     arrived in 093f75b, dev only), so a site deployed from master pairs an
+//     old checkout with this plugin and lands exactly here.
+//   - a location_id that matches no shop (a stale cart, a renamed shop).
+//   - install offered with no shops configured at all.
+// One shop and no id is NOT an error - there is only one possible answer, and
+// aswb_resolve_location() already returns it.
+//
+// WHY THIS HOOK, and why the flag: woocommerce_store_api_cart_errors is the
+// Store API's own "refuse this cart" mechanism - CartController::validate_cart()
+// throws InvalidCartException/409 if any error is added (checked against
+// WooCommerce's own source, not recalled). But validate_cart() is not unique to
+// checkout, and aswb_effective_mode() DEFAULTS to install for a session that
+// has not said - so hooking it unguarded would 409 the cart page of any
+// multi-shop site before the customer had chosen anything at all.
+// woocommerce_store_api_checkout_update_customer_from_request fires exactly
+// once, inside the checkout POST, immediately before that validate_cart() call
+// - so the flag it sets is what confines this to a real attempt to pay.
+add_action('woocommerce_store_api_checkout_update_customer_from_request', 'aswb_mark_checkout_request', 10, 2);
+function aswb_mark_checkout_request($customer, $request) {
+    $GLOBALS['aswb_is_checkout_request'] = true;
+}
+
+add_action('woocommerce_store_api_cart_errors', 'aswb_block_unresolved_install', 10, 2);
+function aswb_block_unresolved_install($errors, $cart) {
+    if (empty($GLOBALS['aswb_is_checkout_request'])) return;
+    if (!($errors instanceof WP_Error)) return;
+    if (aswb_effective_mode() !== 'install') return;
+
+    $id = WC()->session ? (string) WC()->session->get('autosync_location_id', '') : '';
+    if (aswb_resolve_location($id)) return;
+
+    $fees = aswb_fee_settings();
+    $rows = (isset($fees['locations']) && is_array($fees['locations'])) ? $fees['locations'] : [];
+    if (!$rows) {
+        // The client has not set up any shops. The customer cannot fix this and
+        // should not be told to try.
+        $errors->add('aswb_no_install_locations',
+            'Installation is not available right now. Please choose shipping instead, or contact us.');
+        return;
+    }
+    $errors->add('aswb_install_location_unresolved',
+        'We could not tell which of our locations this installation is for. '
+        . 'Please go back, choose your install location, and try again.');
+}
+
 add_action('woocommerce_cart_calculate_fees', 'aswb_apply_fees', 10, 1);
 function aswb_apply_fees($cart) {
     if (is_admin() && !defined('DOING_AJAX')) return;
@@ -1203,6 +1258,17 @@ function aswb_record_mode_on_order($order) {
         $loc = aswb_resolve_location($id);
         if ($loc) $order->update_meta_data('_autosync_install_location', $loc);
     }
+    // Which state decided the rate, and what it came to. Recomputed here rather
+    // than read back off the fee line, so the order carries the ANSWER and not
+    // just the money - "check it in WooCommerce, not just the summary" needs
+    // something to check. The amount still comes from the fee WooCommerce
+    // actually charged, so the two can never disagree.
+    $order->update_meta_data('_autosync_tax_state', aswb_taxable_state($mode));
+    $tax = 0.0;
+    foreach ($order->get_fees() as $fee) {
+        if ($fee->get_name() === 'Sales Tax') $tax += (float) $fee->get_total();
+    }
+    $order->update_meta_data('_autosync_sales_tax', round($tax, 2));
     $order->save();
 }
 
@@ -1276,7 +1342,8 @@ function aswb_order_item_totals($rows, $order) {
         $settled = $order->has_status(['completed', 'refunded']);
         $add['aswb_balance'] = [
             'type' => 'aswb_balance',
-            'label' => $settled ? 'Balance paid at install:' : 'Balance due at install:',
+            'label' => ($settled ? 'Balance paid at install' : 'Balance due at install')
+                       . (((float) $order->get_meta('_autosync_sales_tax')) > 0 ? ' (tax included):' : ':'),
             'value' => wc_price($balance, ['currency' => $order->get_currency()]),
         ];
     }
@@ -1309,11 +1376,24 @@ function aswb_email_deposit_block($order, $sent_to_admin, $plain_text, $email) {
     // currency symbol as the raw entity wc_price() emits ("&#36;"), which
     // esc_html() then turns into visible "&amp;#36;" - so each branch below
     // renders it the way that branch actually needs.
+    // The deposit is a percentage of the FULL order total, and that total
+    // already includes the sales tax fee - aswb_prepare_deposit_child() takes
+    // it straight off $parent->get_total(). So the tax is inside both figures
+    // below, and neither of them is a tax-free subtotal. Saying so here is the
+    // difference between a customer reading "balance due" as the goods and
+    // reading it as what they will actually hand over at the counter.
+    $taxAmt = (float) $order->get_meta('_autosync_sales_tax');
+    $taxState = (string) $order->get_meta('_autosync_tax_state');
     $pairs = [];
     if ($full > 0) $pairs[] = ['Order total', wc_price($full, $cur)];
+    if ($taxAmt > 0) {
+        $pairs[] = [($taxState !== '' ? $taxState . ' sales tax' : 'Sales tax') . ' (included above)',
+                    wc_price($taxAmt, $cur)];
+    }
     $pairs[] = ['Deposit paid today', wc_price($deposit, $cur)];
     if ($balance > 0) {
-        $pairs[] = [$settled ? 'Balance paid at install' : 'Balance due at install',
+        $pairs[] = [($settled ? 'Balance paid at install' : 'Balance due at install')
+                    . ($taxAmt > 0 ? ' (tax included)' : ''),
                     wc_price($balance, $cur)];
     }
 
