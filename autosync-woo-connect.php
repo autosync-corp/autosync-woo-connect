@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.9
+ * Version: 0.10.10
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -1056,6 +1056,15 @@ function aswb_prepare_deposit_child($context, &$result) {
         $child->set_payment_method($context->payment_method);
         $gateways = WC()->payment_gateways() ? WC()->payment_gateways()->payment_gateways() : [];
         $child->set_payment_method_title(isset($gateways[$context->payment_method]) ? $gateways[$context->payment_method]->get_title() : $context->payment_method);
+        // Carried over so the deposit is not a fraud-screening blind spot: the
+        // Stripe gateway builds its metadata from the order it is handed, and
+        // reads ip_address straight off it (confirmed in Payment Plugins
+        // 4.0.19, abstract-wc-stripe-payment.php::add_order_metadata), so a
+        // child with no IP sent Stripe an empty one on every install deposit.
+        // The user agent is copied for WooCommerce's own record only - the
+        // gateway takes the one it puts in Stripe from $_SERVER, not the order.
+        $child->set_customer_ip_address($parent->get_customer_ip_address());
+        $child->set_customer_user_agent($parent->get_customer_user_agent());
         $child->update_meta_data('_autosync_deposit_payment', 'yes');
         $child->update_meta_data('_autosync_parent_order_id', $parent->get_id());
 
@@ -1084,6 +1093,74 @@ function aswb_prepare_deposit_child($context, &$result) {
     }
 
     $context->set_order($child);
+}
+
+// ── What Stripe is told about a deposit payment ───────────────────────────
+// Stripe is handed the CHILD order by set_order() above, so without these it
+// describes the payment by the child's number - "Order 36" for what the
+// customer, their email and every staff lookup call #35 - and lists no
+// products, because the child deliberately carries a fee line instead of the
+// real items. Both were found in the sandbox.
+//
+// Fixed at the gateway's filters rather than by changing the child, because
+// the child's shape is deliberate: a second order carrying the real Wheel and
+// Tire products would count the same goods as sold twice in WooCommerce's
+// stock and sales reporting. Stripe gets the detail; WooCommerce keeps one
+// order per sale.
+//
+// Both hooks were read out of the installed version (Payment Plugins for
+// Stripe WooCommerce 4.0.19), not taken from its documentation, which lists
+// neither one's parameters:
+//   includes/class-wc-stripe-payment-intent.php:249
+//     apply_filters('wc_stripe_payment_intent_args', $args, $order, $this)
+//   includes/abstract/abstract-wc-stripe-payment.php:251
+//     apply_filters('wc_stripe_order_meta_data', $meta_data, $order)
+function aswb_deposit_parent($order) {
+    if (!($order instanceof WC_Order)) return null;
+    if ($order->get_meta('_autosync_deposit_payment') !== 'yes') return null;
+    $parentId = (int) $order->get_meta('_autosync_parent_order_id');
+    if (!$parentId) return null;
+    $parent = wc_get_order($parentId);
+    return ($parent instanceof WC_Order) ? $parent : null;
+}
+
+add_filter('wc_stripe_payment_intent_args', 'aswb_stripe_deposit_description', 10, 2);
+function aswb_stripe_deposit_description($args, $order) {
+    $parent = aswb_deposit_parent($order);
+    if (!$parent) return $args;
+    // Deliberately mirrors the gateway's own 'Order %s from %s' so a deposit
+    // reads like every other payment in the Stripe dashboard, with "(deposit)"
+    // as the only difference and a number staff can actually search for.
+    $args['description'] = sprintf(
+        'Order %s (deposit) from %s',
+        $parent->get_order_number(),
+        wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES)
+    );
+    return $args;
+}
+
+add_filter('wc_stripe_order_meta_data', 'aswb_stripe_deposit_metadata', 10, 2);
+function aswb_stripe_deposit_metadata($meta, $order) {
+    $parent = aswb_deposit_parent($order);
+    if (!$parent) return $meta;
+    $meta['parent_order_id']     = $parent->get_id();
+    $meta['parent_order_number'] = $parent->get_order_number();
+
+    // Keyed item_1, item_2... and NOT the gateway's own 'product_<product_id>'
+    // on purpose: every wheel on this site is the same generic WooCommerce
+    // product and every tire the other (wooWheelProductId/wooTireProductId in
+    // js/config.js), so two wheel lines - a staggered front/rear set is exactly
+    // that - share a product id and collapse to a single key, losing a line.
+    // That collision is the gateway's own code and is left alone here; it is
+    // written up in duetasks as its own decision.
+    $i = 0;
+    foreach ($parent->get_items('line_item') as $item) {
+        // Stripe caps metadata at 50 entries, keys at 40 chars, values at 500.
+        if (count($meta) >= 50) break;
+        $i++;
+        $meta['item_' . $i] = substr(sprintf('%s x %s', $item->get_name(), $item->get_quantity()), 0, 500);
+    }
+    return $meta;
 }
 
 // ── Priority 20 (after Stripe has processed the child at priority 10): the
