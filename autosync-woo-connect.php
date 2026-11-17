@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.11
+ * Version: 0.10.12
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -1156,7 +1156,35 @@ function aswb_str_cut($s, $len) {
     return function_exists('mb_substr') ? mb_substr($s, 0, $len, 'UTF-8') : substr($s, 0, $len);
 }
 
-// One entry per line item, in the order they sit on the order.
+// Decode entities, strip tags, flatten whitespace. Used on both halves of a
+// line now, so it is worth naming once.
+function aswb_clean_text($s) {
+    $s = wp_specialchars_decode(wp_strip_all_tags((string) $s), ENT_QUOTES);
+    // /u returns null on invalid UTF-8 rather than throwing, which would
+    // silently blank a real product name. Keep the original if it fails.
+    $flat = preg_replace('/\s+/u', ' ', $s);
+    if ($flat !== null) $s = $flat;
+    return trim($s);
+}
+
+// The part number comes off the line's own meta, under the exact label added
+// in woocommerce_checkout_create_order_line_item below - so it is the same
+// string the customer's email and the admin order screen print, not a second
+// derivation of it. Orders placed before 0.10.0 carry the older
+// 'AutoSync Part Number' label and a pending one of those can still be paid,
+// so both are read.
+function aswb_item_part_number($item) {
+    foreach (array('Part Number', 'AutoSync Part Number') as $label) {
+        $pn = aswb_clean_text($item->get_meta($label));
+        if ($pn !== '') return $pn;
+    }
+    return '';
+}
+
+// One entry per line item, in the order they sit on the order:
+//
+//   Fuel Assault - 20x10 (PN D54620009846) ×4
+//
 // get_name() is deliberately the source: it is the name already printed on the
 // customer's email, the admin order screen and the invoice (aswb_line_item_name
 // builds it, appending the size), so the Stripe record matches the paperwork a
@@ -1165,19 +1193,23 @@ function aswb_str_cut($s, $len) {
 function aswb_stripe_item_list($order) {
     $out = array();
     foreach ($order->get_items('line_item') as $item) {
-        $name = wp_specialchars_decode(wp_strip_all_tags((string) $item->get_name()), ENT_QUOTES);
-        // /u returns null on invalid UTF-8 rather than throwing, which would
-        // silently blank a real product name. Keep the original if it fails.
-        $flat = preg_replace('/\s+/u', ' ', $name);
-        if ($flat !== null) $name = $flat;
-        $name = trim($name);
-        if ($name === '') continue;
+        $name = aswb_clean_text($item->get_name());
+        $pn   = aswb_item_part_number($item);
+        // A line with neither is not nameable; a line with only one of them
+        // is still a real line and gets named by whichever it has.
+        if ($name === '' && $pn === '') continue;
+        if ($name === '') {
+            $label = 'PN ' . $pn;
+        } elseif ($pn === '') {
+            $label = $name;
+        } else {
+            $label = $name . ' (PN ' . $pn . ')';
+        }
         $qty = (int) $item->get_quantity();
-        $out[] = ($qty > 0) ? $name . ' ×' . $qty : $name;
+        $out[] = ($qty > 0) ? $label . ' ×' . $qty : $label;
     }
     return $out;
 }
-
 function aswb_stripe_description($prefix, $order) {
     $items = aswb_stripe_item_list($order);
     if (!$items) return '';
