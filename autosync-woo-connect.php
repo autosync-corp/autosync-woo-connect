@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.10
+ * Version: 0.10.11
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -1124,18 +1124,103 @@ function aswb_deposit_parent($order) {
     return ($parent instanceof WC_Order) ? $parent : null;
 }
 
-add_filter('wc_stripe_payment_intent_args', 'aswb_stripe_deposit_description', 10, 2);
-function aswb_stripe_deposit_description($args, $order) {
+// ── What Stripe is told was bought ────────────────────────────
+// The gateway writes "Order 39 from <site>" and stops, so nothing in Stripe
+// ever named the goods - and Stripe is where a dispute is argued, built from
+// the PaymentIntent rather than from WooCommerce. The description now carries
+// the order number and every line on the order:
+//
+//   Order 39 – Fuel Assault - 20x10 ×4, Venom Power Terra Hunter R/T+ - 285/55R20 ×4
+//
+// A deposit is paid by a CHILD order whose only line is the deposit fee, so
+// those list the PARENT's items - the child has nothing to name.
+//
+// LENGTH. Stripe does not document a maximum for PaymentIntent.description;
+// the API reference calls it only "an arbitrary string". 1000 is the figure in
+// common use and what was asked for. The failure mode is worth being exact
+// about: an over-long value is a parameter_invalid_string_length error, which
+// does not shorten the description - it FAILS THE PAYMENT. So the cap is
+// enforced here rather than hoped for, and it is filterable so a site that
+// ever hits a lower real limit can drop it without waiting for a release.
+function aswb_stripe_desc_max() {
+    return max(80, (int) apply_filters('aswb_stripe_description_max', 1000));
+}
+
+// Stripe counts characters, not bytes, and both the separator and the × are
+// multibyte. mbstring is near-universal but not guaranteed, hence the guards.
+function aswb_str_len($s) {
+    return function_exists('mb_strlen') ? mb_strlen($s, 'UTF-8') : strlen($s);
+}
+
+function aswb_str_cut($s, $len) {
+    return function_exists('mb_substr') ? mb_substr($s, 0, $len, 'UTF-8') : substr($s, 0, $len);
+}
+
+// One entry per line item, in the order they sit on the order.
+// get_name() is deliberately the source: it is the name already printed on the
+// customer's email, the admin order screen and the invoice (aswb_line_item_name
+// builds it, appending the size), so the Stripe record matches the paperwork a
+// chargeback would be argued with. Shipping and fees are not line_item, so the
+// deposit fee and the install/shipping charge stay out of the list.
+function aswb_stripe_item_list($order) {
+    $out = array();
+    foreach ($order->get_items('line_item') as $item) {
+        $name = wp_specialchars_decode(wp_strip_all_tags((string) $item->get_name()), ENT_QUOTES);
+        // /u returns null on invalid UTF-8 rather than throwing, which would
+        // silently blank a real product name. Keep the original if it fails.
+        $flat = preg_replace('/\s+/u', ' ', $name);
+        if ($flat !== null) $name = $flat;
+        $name = trim($name);
+        if ($name === '') continue;
+        $qty = (int) $item->get_quantity();
+        $out[] = ($qty > 0) ? $name . ' ×' . $qty : $name;
+    }
+    return $out;
+}
+
+function aswb_stripe_description($prefix, $order) {
+    $items = aswb_stripe_item_list($order);
+    if (!$items) return '';
+    $max  = aswb_stripe_desc_max();
+    $full = $prefix . ' – ' . implode(', ', $items);
+    if (aswb_str_len($full) <= $max) return $full;
+
+    // Over the cap. Drop whole items from the end and say how many went,
+    // rather than cutting a product name in half: half a name reads as a
+    // different product, while "+3 more" at least tells the reader the list is
+    // not everything. Order is preserved rather than cherry-picking whatever
+    // happens to fit.
+    $total = count($items);
+    $kept  = array();
+    foreach ($items as $one) {
+        $try  = array_merge($kept, array($one));
+        $cand = $prefix . ' – ' . implode(', ', $try) . sprintf(' +%d more', $total - count($try));
+        if (aswb_str_len($cand) > $max) break;
+        $kept = $try;
+    }
+    // A single item longer than the whole budget: keep the number, which is
+    // the one thing staff search on.
+    if (!$kept) return aswb_str_cut($prefix, $max);
+    return $prefix . ' – ' . implode(', ', $kept) . sprintf(' +%d more', $total - count($kept));
+}
+
+add_filter('wc_stripe_payment_intent_args', 'aswb_stripe_payment_description', 10, 2);
+function aswb_stripe_payment_description($args, $order) {
+    if (!($order instanceof WC_Order)) return $args;
     $parent = aswb_deposit_parent($order);
-    if (!$parent) return $args;
-    // Deliberately mirrors the gateway's own 'Order %s from %s' so a deposit
-    // reads like every other payment in the Stripe dashboard, with "(deposit)"
-    // as the only difference and a number staff can actually search for.
-    $args['description'] = sprintf(
-        'Order %s (deposit) from %s',
-        $parent->get_order_number(),
-        wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES)
-    );
+    $source = $parent ? $parent : $order;
+    // "(deposit)" is the only thing marking this apart from a full payment, and
+    // the number is the PARENT's - the one the customer and staff both use.
+    $prefix = 'Order ' . $source->get_order_number() . ($parent ? ' (deposit)' : '');
+    $desc   = aswb_stripe_description($prefix, $source);
+    if ($desc !== '') {
+        $args['description'] = $desc;
+    } elseif ($parent) {
+        // Nothing nameable to list, but the child's number is still the wrong
+        // one to report, so the parent's still has to replace it.
+        $args['description'] = $prefix . ' from ' . wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+    }
+    // An ordinary order with no nameable lines keeps the gateway's own text.
     return $args;
 }
 
