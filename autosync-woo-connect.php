@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.12
+ * Version: 0.10.13
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -432,7 +432,55 @@ function aswb_fee_settings() {
     if (!is_array($live) || !isset($live['mountBalanceAmount'])) return $fallback;
 
     set_transient('aswb_fee_settings_live', $live, 10 * MINUTE_IN_SECONDS);
+    aswb_bust_shipping_cache_if_pricing_changed($live);
     return $live;
+}
+
+// Only the inputs aswb_shipping_amount() actually uses, normalised, so that
+// "12" and 12 are the same thing and a poll that fetched identical settings
+// does not look like a change. A signature that is noisy would recalculate
+// every cart's shipping on every ten-minute poll forever.
+function aswb_shipping_pricing_signature($settings) {
+    return wp_json_encode(array(
+        'enabled' => !empty($settings['shippingEnabled']),
+        'amount'  => (float) (isset($settings['shippingAmount']) ? $settings['shippingAmount'] : 0),
+        'waiver'  => isset($settings['shippingWaiver']) ? (string) $settings['shippingWaiver'] : '',
+        'freeSet' => (float) (isset($settings['freeSetSize']) ? $settings['freeSetSize'] : 0),
+    ));
+}
+
+// WooCommerce caches calculated shipping rates in the CUSTOMER'S SESSION, under
+// shipping_for_package_<n>, and only recalculates when the package hash changes
+// (WC_Shipping::calculate_shipping_for_package). That hash is
+// md5( wp_json_encode($package) . WC_Cache_Helper::get_transient_version('shipping') ) -
+// the items, the destination, and a global version string. Editing a fee
+// changes NONE of them, so a cart that already exists keeps quoting the old
+// shipping cost indefinitely, the storefront's total guard refuses to pay, and
+// reloading does not help because a reload reuses the same session. The only
+// thing that fixed it was clearing the cart token, i.e. a new session.
+//
+// Regenerating that transient version changes the hash for EVERY session at
+// once, which is exactly the reach this needs: one write, every open cart
+// recalculates on its next request.
+//
+// aswb_price_shipping_rates() was never wrong. It just stopped being called.
+function aswb_bust_shipping_cache_if_pricing_changed($live) {
+    $sig  = aswb_shipping_pricing_signature($live);
+    $prev = get_option('aswb_shipping_pricing_sig', null);
+
+    // First fetch on this install: record it, bust nothing. There is no stale
+    // rate to clear yet, and a needless global invalidation on activation
+    // would make every open cart recalculate for no reason.
+    if ($prev === null) {
+        update_option('aswb_shipping_pricing_sig', $sig, false);
+        return;
+    }
+    if ($prev === $sig) return;
+
+    update_option('aswb_shipping_pricing_sig', $sig, false);
+    if (class_exists('WC_Cache_Helper')) {
+        WC_Cache_Helper::get_transient_version('shipping', true);
+    }
 }
 
 // The storefront's own business name, from autosyncadmin via fee-config.php,
