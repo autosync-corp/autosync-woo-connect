@@ -7,7 +7,7 @@
  *              Tire) carry the real SKU/brand as cart-item metadata, and the
  *              real price is verified server-side against the live AutoSync
  *              API on every total calculation, never trusted from the browser.
- * Version: 0.10.13
+ * Version: 0.10.14
  *
  * Install: upload the zip via Plugins -> Add New Plugin -> Upload Plugin,
  * then Activate. After the first install, updates are automatic (see below) -
@@ -218,6 +218,114 @@ function aswb_sanitize_fee_settings($raw) {
     ];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// WordPress content cache: purge when content changes
+//
+// The storefront reads this site's REST API server-side on every request and
+// caches nothing of its own. Despite that, a published post could take more than
+// 15 minutes to appear in /blog/ and sitemap.xml, and a trashed one kept being
+// served for 6+ minutes. The cache is SiteGround's Dynamic Cache, on THIS host:
+// the REST endpoints answer with no Cache-Control header at all and carry
+// X-Proxy-Cache-Info, so an intermediary is free to hold them.
+//
+// Why SG's own purge was not already covering it: Supercacher::purge_rest_cache()
+// returns early unless the `siteground_optimizer_purge_rest_cache` option is
+// enabled, so on a default install the REST namespace is never purged even though
+// page caches are. That is exactly the reported split - a new PAGE appeared at
+// once while a new POST never did. Calling purge_cache_request() against
+// get_rest_url() ourselves does not depend on that option being found and turned
+// on by hand.
+
+const ASWB_PURGE_POST_TYPES = ['post', 'page'];
+
+// Which mechanism this site will actually use. Returned rather than assumed so
+// the settings screen can state it: a fallback nobody can see the status of is
+// indistinguishable from one that is not working.
+function aswb_cache_purge_method() {
+    if (function_exists('sg_cachepress_purge_cache')) return 'sg-helper';
+    if (class_exists('\SiteGround_Optimizer\Supercacher\Supercacher')) return 'sg-class';
+    return 'headers-only';
+}
+
+function aswb_purge_wp_content_cache() {
+    // Once per request is enough - a single save can fire save_post plus a status
+    // transition, and each purge is an HTTP request of its own.
+    static $done = false;
+    if ($done) return;
+    $done = true;
+
+    // Object caches (Memcached, Redis) sit in front of everything else, so this
+    // runs whatever the host cache turns out to be.
+    if (function_exists('wp_cache_flush')) wp_cache_flush();
+
+    $method = aswb_cache_purge_method();
+    $restUrl = function_exists('get_rest_url') ? get_rest_url() : '';
+
+    if ($method === 'sg-helper') {
+        // The documented public API, global and kept for backward compatibility.
+        // Purged twice on purpose: the REST namespace is what the storefront
+        // reads, and the site root is what a human visiting wp-admin expects.
+        if ($restUrl !== '') sg_cachepress_purge_cache($restUrl);
+        sg_cachepress_purge_cache();
+    } elseif ($method === 'sg-class') {
+        $sc = '\SiteGround_Optimizer\Supercacher\Supercacher';
+        if ($restUrl !== '') call_user_func([$sc, 'purge_cache_request'], $restUrl, true);
+        call_user_func([$sc, 'purge_cache']);
+    }
+    // 'headers-only' needs nothing here: aswb_rest_no_cache_headers() below stops
+    // the responses being cacheable in the first place.
+
+    do_action('aswb_purged_wp_content_cache', $method);
+}
+
+// save_post fires for autosaves, revisions and every custom post type; without
+// these guards a draft autosave every 60 seconds would purge the whole site.
+function aswb_purge_on_save($postId, $post = null) {
+    if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
+    if (wp_is_post_revision($postId) || wp_is_post_autosave($postId)) return;
+    $type = $post ? $post->post_type : get_post_type($postId);
+    if (!in_array($type, ASWB_PURGE_POST_TYPES, true)) return;
+    aswb_purge_wp_content_cache();
+}
+
+function aswb_purge_on_transition($new, $old, $post) {
+    if (!$post || !in_array($post->post_type, ASWB_PURGE_POST_TYPES, true)) return;
+    if ($new === $old) return;
+    // Covers publish, unpublish, schedule->publish and trash in one hook - a
+    // scheduled post goes live with no save_post from a human at all.
+    aswb_purge_wp_content_cache();
+}
+
+function aswb_purge_on_delete($postId) {
+    if (!in_array(get_post_type($postId), ASWB_PURGE_POST_TYPES, true)) return;
+    aswb_purge_wp_content_cache();
+}
+
+add_action('save_post', 'aswb_purge_on_save', 20, 2);
+add_action('transition_post_status', 'aswb_purge_on_transition', 20, 3);
+add_action('trashed_post', 'aswb_purge_on_delete', 20, 1);
+add_action('untrashed_post', 'aswb_purge_on_delete', 20, 1);
+// before_delete_post rather than deleted_post: the post type is still readable.
+add_action('before_delete_post', 'aswb_purge_on_delete', 20, 1);
+
+// The fallback, and a belt-and-braces measure even where SG is present: tell
+// every intermediary not to hold the routes the storefront reads. Without this a
+// host with no purge API of ours would stay stale until its own TTL expired.
+function aswb_rest_no_cache_headers($result, $server, $request) {
+    if (!is_object($request) || !method_exists($request, 'get_route')) return $result;
+    // Only the storefront's own reads. Blanketing every route would also strip
+    // caching from WooCommerce's Store API, which is hot during checkout.
+    if (!preg_match('#^/wp/v2/(posts|pages|media|categories|tags)\b#', $request->get_route())) {
+        return $result;
+    }
+    if (is_object($result) && method_exists($result, 'header')) {
+        $result->header('Cache-Control', 'no-cache, must-revalidate, max-age=0');
+        $result->header('Expires', 'Wed, 11 Jan 1984 05:00:00 GMT');
+    }
+    return $result;
+}
+add_filter('rest_post_dispatch', 'aswb_rest_no_cache_headers', 10, 3);
+
 function aswb_render_settings_page() {
     if (!current_user_can('manage_options')) return;
     ?>
@@ -240,6 +348,50 @@ function aswb_render_settings_page() {
             <td>
               <input type="text" id="aswb_core_site_url" name="aswb_core_site_url" value="<?php echo esc_attr(get_option('aswb_core_site_url', '')); ?>" class="regular-text" placeholder="https://devcore.autosynccorp.com">
               <p class="description">The core site's own URL (not this WordPress site). When set, fee/shipping/tax values below are fetched live from <code>{this URL}/fee-config.php</code> and cached for 10 minutes - <code>autosyncadmin</code> becomes the real source of truth. Leave blank to always use the values below directly.</p>
+            </td>
+          </tr>
+          <tr>
+            <th>WordPress cache</th>
+            <td>
+              <?php
+              $aswbMethod = aswb_cache_purge_method();
+              $aswbLabels = [
+                  'sg-helper'    => ['SiteGround Optimizer <code>sg_cachepress_purge_cache()</code>', '#1e7e34'],
+                  'sg-class'     => ['SiteGround Optimizer <code>Supercacher</code> class', '#1e7e34'],
+                  'headers-only' => ['No host purge API found - headers only', '#8a6d00'],
+              ];
+              [$aswbLabel, $aswbColour] = $aswbLabels[$aswbMethod];
+              ?>
+              <strong style="color:<?php echo esc_attr($aswbColour); ?>"><?php echo wp_kses_post($aswbLabel); ?></strong>
+              <p class="description">
+                Publishing, updating, trashing, restoring or deleting a post or page purges the cache,
+                so the storefront's blog list, pages and <code>sitemap.xml</code> update immediately
+                instead of serving content that has already changed.
+                <?php if ($aswbMethod === 'headers-only'): ?>
+                  This site has no purge API this plugin recognises, so it relies entirely on sending
+                  <code>Cache-Control: no-cache</code> on the REST routes the storefront reads. That works,
+                  but only for caches that honour the header.
+                <?php endif; ?>
+              </p>
+              <?php
+              // SG purges its own REST cache only when this option is on, which is
+              // why a new PAGE could appear instantly while a new POST did not. We
+              // purge the REST namespace directly and do not depend on it - but it
+              // is worth showing, because it explains the symptom.
+              if ($aswbMethod !== 'headers-only' && class_exists('\SiteGround_Optimizer\Options\Options')) {
+                  $aswbRestOpt = (bool) get_option('siteground_optimizer_purge_rest_cache', 0);
+                  echo '<p class="description">SiteGround\'s own REST-cache purging is <strong>'
+                     . ($aswbRestOpt ? 'on' : 'off')
+                     . '</strong>. This plugin purges the REST namespace itself either way, so this is '
+                     . 'informational: with it off, SiteGround alone would leave the storefront reading '
+                     . 'stale posts.</p>';
+              }
+              ?>
+              <p class="description">
+                <code>Cache-Control: no-cache</code> is also sent on <code>/wp/v2/posts</code>,
+                <code>pages</code>, <code>media</code>, <code>categories</code> and <code>tags</code> -
+                and deliberately NOT on WooCommerce's Store API, which is hot during checkout.
+              </p>
             </td>
           </tr>
           <tr>
